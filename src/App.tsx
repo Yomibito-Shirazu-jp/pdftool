@@ -1,0 +1,1786 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import * as pdfjs from 'pdfjs-dist';
+import { PDFDocument, rgb } from 'pdf-lib';
+import { GoogleGenAI, Type as GenAIType } from "@google/genai";
+import { auth, db, googleProvider, signInWithPopup, onAuthStateChanged, collection, addDoc, query, where, orderBy, onSnapshot, doc, deleteDoc, getDoc, getDocs, Timestamp, User, handleFirestoreError, OperationType } from './firebase';
+import { 
+  FileUp, 
+  ChevronLeft, 
+  ChevronRight, 
+  ZoomIn, 
+  ZoomOut,
+  Save,
+  AlertCircle,
+  Settings,
+  Layers,
+  PanelLeftOpen,
+  Sparkles,
+  Pen,
+  Maximize,
+  Search,
+  FileText,
+  Image,
+  ImageIcon,
+  Code,
+  Database
+} from 'lucide-react';
+import { cn } from './lib/utils';
+import { motion, AnimatePresence } from 'motion/react';
+
+import { Tool, Annotation, TextBlock } from './types';
+import { FONTS } from './constants';
+import { Sidebar } from './components/Sidebar';
+import { PropertiesPanel } from './components/PropertiesPanel';
+import { ToolPalette } from './components/ToolPalette';
+
+// Configure PDF.js worker using a reliable CDN
+pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+
+export { pdfjs };
+
+export default function App() {
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [pdfDoc, setPdfDoc] = useState<pdfjs.PDFDocumentProxy | null>(null);
+  const [numPages, setNumPages] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [scale, setScale] = useState(1.5);
+  const [activeTool, setActiveTool] = useState<Tool>('select');
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [currentColor, setCurrentColor] = useState('#000000');
+  const [currentFontSize, setCurrentFontSize] = useState(16);
+  const [currentFontFamily, setCurrentFontFamily] = useState('Arial Unicode MS');
+  const [currentTextAlign, setCurrentTextAlign] = useState<'left' | 'center' | 'right'>('left');
+  const [isBold, setIsBold] = useState(false);
+  const [isItalic, setIsItalic] = useState(false);
+  const [isUnderline, setIsUnderline] = useState(false);
+  
+  const [loadingError, setLoadingError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [textBlocks, setTextBlocks] = useState<TextBlock[]>([]);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [scanProgress, setScanProgress] = useState(0);
+  const [timeRemaining, setTimeRemaining] = useState(0);
+  const [scanPhase, setScanPhase] = useState<'doc-ai' | 'gemini-correction' | 'polishing'>('doc-ai');
+  const [processorId, setProcessorId] = useState(process.env.DOCUMENT_AI_PROCESSOR_ID || '8294184ec60f19aa');
+  const [projectId, setProjectId] = useState(process.env.GOOGLE_CLOUD_PROJECT_ID || 'aidriven-mastering-fyqu');
+  
+  const [user, setUser] = useState<User | null>(null);
+  const [versions, setVersions] = useState<any[]>([]);
+  const [comparingVersion, setComparingVersion] = useState<any | null>(null);
+  const [isVersionHistoryOpen, setIsVersionHistoryOpen] = useState(false);
+  const [isSavingVersion, setIsSavingVersion] = useState(false);
+  const [versionName, setVersionName] = useState('');
+  const [pageImages, setPageImages] = useState<Record<number, string>>({});
+  const [viewMode, setViewMode] = useState<'canvas' | 'css'>('canvas');
+  const [showBackground, setShowBackground] = useState(true);
+  const [globalCss, setGlobalCss] = useState<string>(`
+/* Vivliostyle-like CSS Typesetting */
+@page {
+  size: A4;
+  margin: 0;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #f0f0f0;
+  font-family: "Noto Sans JP", sans-serif;
+}
+
+.page {
+  position: relative;
+  width: 210mm;
+  height: 297mm;
+  background-color: white;
+  margin: 20px auto;
+  box-shadow: 0 0 10px rgba(0,0,0,0.1);
+  overflow: hidden;
+  page-break-after: always;
+}
+
+@media print {
+  body { background: none; }
+  .page { margin: 0; box-shadow: none; }
+}
+
+.annotation {
+  position: absolute;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-edit {
+  background-color: white; /* Mask original text */
+}
+
+/* Custom Typesetting Classes */
+.main-title {
+  font-size: 36pt;
+  font-weight: 900;
+  text-align: center;
+  margin-top: 50mm;
+  color: #E5322E;
+}
+
+.chapter-header {
+  font-size: 24pt;
+  font-weight: bold;
+  border-bottom: 2px solid #333;
+  margin-bottom: 10mm;
+}
+
+.body-text {
+  font-size: 11pt;
+  line-height: 1.8;
+  text-align: justify;
+}
+
+.page-number {
+  position: absolute;
+  bottom: 10mm;
+  width: 100%;
+  text-align: center;
+  font-size: 9pt;
+  color: #999;
+}
+`);
+
+  const [isDraggingAnn, setIsDraggingAnn] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user || !pdfFile) return;
+
+    const q = query(
+      collection(db, 'versions'),
+      where('uid', '==', user.uid),
+      where('documentId', '==', pdfFile.name),
+      orderBy('createdAt', 'desc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const newVersions = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setVersions(newVersions);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'versions');
+    });
+
+    return () => unsubscribe();
+  }, [user, pdfFile]);
+
+  const login = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error('Login Error:', error);
+    }
+  };
+
+  const saveVersion = async () => {
+    if (!user || !pdfFile || !versionName.trim()) return;
+    setIsSavingVersion(true);
+    try {
+      const versionData = {
+        documentId: pdfFile.name,
+        name: versionName,
+        annotations: annotations,
+        createdAt: Timestamp.now(),
+        uid: user.uid
+      };
+      await addDoc(collection(db, 'versions'), versionData);
+      setVersionName('');
+      setIsVersionHistoryOpen(false);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'versions');
+    } finally {
+      setIsSavingVersion(false);
+    }
+  };
+
+  const revertToVersion = (version: any) => {
+    setAnnotations(version.annotations);
+    setComparingVersion(null);
+    setIsVersionHistoryOpen(false);
+  };
+
+  const toggleCompareVersion = (version: any) => {
+    if (comparingVersion?.id === version.id) {
+      setComparingVersion(null);
+    } else {
+      setComparingVersion(version);
+    }
+    setIsVersionHistoryOpen(false);
+  };
+
+  const deleteVersion = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'versions', id));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, `versions/${id}`);
+    }
+  };
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file && file.type === 'application/pdf') {
+      setLoadingError(null);
+      setIsLoading(true);
+      setPdfFile(file);
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const typedarray = new Uint8Array(e.target?.result as ArrayBuffer);
+          const loadingTask = pdfjs.getDocument({ data: typedarray });
+          const pdf = await loadingTask.promise;
+          setPdfDoc(pdf);
+          setNumPages(pdf.numPages);
+          setCurrentPage(1);
+          setIsLoading(false);
+        } catch (err) {
+          console.error('Error loading PDF:', err);
+          setLoadingError('Failed to load PDF. Please try another file.');
+          setIsLoading(false);
+          setPdfFile(null);
+        }
+      };
+      reader.onerror = () => {
+        setLoadingError('Failed to read file.');
+        setIsLoading(false);
+      };
+      reader.readAsArrayBuffer(file);
+    } else if (file) {
+      setLoadingError('Please select a valid PDF file.');
+    }
+  };
+
+  const fetchWithRetry = async (url: string, options: RequestInit, retries = 3, backoff = 1000): Promise<Response> => {
+    try {
+      const response = await fetch(url, options);
+      if (!response.ok && retries > 0) {
+        const errorData = await response.json().catch(() => ({}));
+        console.warn(`Fetch failed (status ${response.status}), retrying... (${retries} left)`, errorData);
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return fetchWithRetry(url, options, retries - 1, backoff * 2);
+      }
+      return response;
+    } catch (err) {
+      if (retries > 0) {
+        console.warn(`Fetch error, retrying... (${retries} left)`, err);
+        await new Promise(resolve => setTimeout(resolve, backoff));
+        return fetchWithRetry(url, options, retries - 1, backoff * 2);
+      }
+      throw err;
+    }
+  };
+
+  const detectTextAI = async () => {
+    if (!canvasRef.current || !pdfDoc) return;
+    
+    setIsDetecting(true);
+    setScanProgress(0);
+    setScanPhase('doc-ai');
+    setTimeRemaining(60); // Increased time for Document AI + Gemini pipeline
+
+    const progressInterval = setInterval(() => {
+      setScanProgress(prev => {
+        if (prev >= 98) return prev;
+        const increment = Math.random() * 1.5;
+        return Math.min(98, prev + increment);
+      });
+      setTimeRemaining(prev => Math.max(1, prev - 1));
+    }, 1000);
+
+    try {
+      const originalCanvas = canvasRef.current;
+      const maxDim = 3072; // Increased resolution for better OCR
+      let width = originalCanvas.width;
+      let height = originalCanvas.height;
+      
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = (maxDim / width) * height;
+          width = maxDim;
+        } else {
+          width = (maxDim / height) * width;
+          height = maxDim;
+        }
+      }
+      
+      const offscreenCanvas = document.createElement('canvas');
+      offscreenCanvas.width = width;
+      offscreenCanvas.height = height;
+      const ctx = offscreenCanvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(originalCanvas, 0, 0, width, height);
+      }
+      
+      const imageData = offscreenCanvas.toDataURL('image/jpeg', 0.98).split(',')[1];
+      
+      // --- PHASE 1: Document AI Detection ---
+      setScanPhase('doc-ai');
+      setScanProgress(5);
+      
+      let docAIBlocks = [];
+      try {
+        const docAIResponse = await fetchWithRetry('/api/detect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            image: imageData,
+            processorId: processorId,
+            projectId: projectId
+          })
+        });
+
+        if (!docAIResponse.ok) {
+          const errorData = await docAIResponse.json().catch(() => ({}));
+          console.warn("Document AI failed, falling back to Gemini-only analysis.", errorData);
+          // We don't throw here, we just continue with empty blocks
+        } else {
+          const data = await docAIResponse.json();
+          docAIBlocks = data.blocks || [];
+        }
+      } catch (err) {
+        console.warn("Document AI request failed, falling back to Gemini-only analysis.", err);
+      }
+
+      if (docAIBlocks.length === 0) {
+        console.info("Proceeding with image-only Gemini analysis.");
+      }
+
+      // --- PHASE 2: Gemini Adjustment & Correction ---
+      setScanPhase('gemini-correction');
+      setScanProgress(30);
+      
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) throw new Error("Gemini API Key is missing");
+      const ai = new GoogleGenAI({ apiKey });
+
+      const geminiWithRetry = async (retries = 2): Promise<any> => {
+        try {
+          const correctionResponse = await ai.models.generateContent({
+            model: "gemini-3.1-pro-preview",
+            contents: [
+              {
+                parts: [
+                  { text: `I have performed OCR detection. Here are the raw blocks: ${JSON.stringify(docAIBlocks)}. 
+                  
+                  Your task is to:
+                  1) Use the provided image as the ground truth.
+                  2) Refine the bounding boxes for absolute precision (ymin, xmin, ymax, xmax in 0-1000 normalized coordinates).
+                  3) Correct any OCR errors, missing characters, or punctuation.
+                  4) Extract styling: fontSize (pt), fontFamily (best match), textAlign (left/center/right), color (hex), fontWeight (bold/normal), fontStyle (italic/normal).
+                  5) Group related text into logical blocks if they belong to the same paragraph.
+                  
+                  Return ONLY a JSON array of objects with the schema: { text: string, box: [number, number, number, number], fontSize: number, fontFamily: string, textAlign: string, color: string, fontWeight: string, fontStyle: string }.` },
+                  { inlineData: { mimeType: "image/jpeg", data: imageData } }
+                ]
+              }
+            ],
+            config: {
+              systemInstruction: "You are a high-precision Document Reconstruction Engine. Your output must be visually identical to the original document when rendered. Return valid JSON only.",
+              responseMimeType: "application/json"
+            }
+          });
+
+          const text = correctionResponse.text;
+          if (!text) throw new Error("Gemini returned an empty response");
+          
+          try {
+            const parsed = JSON.parse(text);
+            if (!Array.isArray(parsed)) throw new Error("Gemini response is not an array");
+            return parsed;
+          } catch (e) {
+            console.error("Failed to parse Gemini JSON:", text);
+            throw new Error("Invalid JSON format from Gemini");
+          }
+        } catch (err) {
+          if (retries > 0) {
+            console.warn(`Gemini error, retrying... (${retries} left)`, err);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            return geminiWithRetry(retries - 1);
+          }
+          throw err;
+        }
+      };
+
+      const finalResult = await geminiWithRetry();
+
+      // --- PHASE 3: Final Polish ---
+      setScanPhase('polishing');
+      setScanProgress(80);
+      
+      const canvasWidth = canvasRef.current.width / scale;
+      const canvasHeight = canvasRef.current.height / scale;
+
+      const otherAnnotations = annotations.filter(a => a.page !== currentPage || a.type !== 'ai-edit');
+
+      const newAnnotations: Annotation[] = finalResult.map((item: any) => {
+        // Basic validation of item properties
+        const text = item.text || "";
+        const box = Array.isArray(item.box) && item.box.length === 4 ? item.box : [0, 0, 100, 100];
+        
+        return {
+          id: Math.random().toString(36).substr(2, 9),
+          type: 'ai-edit',
+          page: currentPage,
+          x: (box[1] / 1000) * canvasWidth,
+          y: (box[0] / 1000) * canvasHeight,
+          width: ((box[3] - box[1]) / 1000) * canvasWidth,
+          height: ((box[2] - box[0]) / 1000) * canvasHeight,
+          content: text,
+          color: item.color || '#000000',
+          fontSize: item.fontSize || 12,
+          fontFamily: item.fontFamily || 'Noto Sans JP',
+          textAlign: item.textAlign || 'left',
+          fontWeight: item.fontWeight === 'bold' ? 'bold' : 'normal',
+          fontStyle: item.fontStyle || 'normal'
+        };
+      });
+
+      setAnnotations([...otherAnnotations, ...newAnnotations]);
+      setScanProgress(100);
+      setTimeRemaining(0);
+      setTimeout(() => {
+        setIsDetecting(false);
+        setActiveTool('select');
+      }, 500);
+    } catch (err: any) {
+      console.error('Pipeline Error:', err);
+      setLoadingError(`Pipeline Error: ${err.message}`);
+      setIsDetecting(false);
+    } finally {
+      clearInterval(progressInterval);
+    }
+  };
+
+  const smartFormatAI = async () => {
+    if (!canvasRef.current || annotations.length === 0) return;
+    
+    setIsDetecting(true);
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) throw new Error("Gemini API Key is missing");
+      
+      const ai = new GoogleGenAI({ apiKey });
+      const imageData = canvasRef.current.toDataURL('image/jpeg', 1.0).split(',')[1];
+      
+      const pageAnnotations = annotations.filter(a => a.page === currentPage);
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [
+          {
+            parts: [
+              { text: `Analyze these text blocks and suggest professional formatting improvements (font size, weight, alignment) based on their content and context. 
+              Current blocks: ${JSON.stringify(pageAnnotations.map(a => ({ id: a.id, text: a.content, size: a.fontSize, weight: a.fontWeight, align: a.textAlign })))}
+              
+              Identify titles, headers, and body text. Standardize font sizes (e.g., Titles: 24pt+, Headers: 18pt, Body: 12pt). Fix alignment inconsistencies.
+              Return a JSON array of objects with { id, fontSize, fontWeight, textAlign }.` },
+              { inlineData: { mimeType: "image/jpeg", data: imageData } }
+            ]
+          }
+        ],
+        config: {
+          systemInstruction: "You are a professional document formatting expert. Your goal is to make the document look polished and consistent. Return ONLY a JSON array.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: GenAIType.ARRAY,
+            items: {
+              type: GenAIType.OBJECT,
+              properties: {
+                id: { type: GenAIType.STRING },
+                fontSize: { type: GenAIType.NUMBER },
+                fontWeight: { type: GenAIType.STRING },
+                textAlign: { type: GenAIType.STRING }
+              },
+              required: ["id"]
+            }
+          }
+        }
+      });
+
+      const suggestions = JSON.parse(response.text);
+      
+      setAnnotations(prev => prev.map(ann => {
+        const suggestion = suggestions.find((s: any) => s.id === ann.id);
+        if (suggestion) {
+          return {
+            ...ann,
+            fontSize: suggestion.fontSize || ann.fontSize,
+            fontWeight: suggestion.fontWeight || ann.fontWeight,
+            textAlign: suggestion.textAlign || ann.textAlign
+          };
+        }
+        return ann;
+      }));
+      
+    } catch (err) {
+      console.error('Smart Format Error:', err);
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+
+  const smartTypesetAI = async () => {
+    if (!canvasRef.current || annotations.length === 0) return;
+    
+    setIsDetecting(true);
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) throw new Error("Gemini API Key is missing");
+      
+      const ai = new GoogleGenAI({ apiKey });
+      const imageData = canvasRef.current.toDataURL('image/jpeg', 1.0).split(',')[1];
+      
+      const pageAnnotations = annotations.filter(a => a.page === currentPage);
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [
+          {
+            parts: [
+              { text: `Analyze these text blocks and assign appropriate CSS classes for typesetting.
+              Available classes in the global CSS: .main-title, .chapter-header, .body-text, .page-number.
+              
+              Current blocks: ${JSON.stringify(pageAnnotations.map(a => ({ id: a.id, text: a.content })))}
+              
+              Return a JSON array of objects with { id, className }.` },
+              { inlineData: { mimeType: "image/jpeg", data: imageData } }
+            ]
+          }
+        ],
+        config: {
+          systemInstruction: "You are a professional book typesetter. Assign the most appropriate semantic class to each text block. Return ONLY a JSON array.",
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: GenAIType.ARRAY,
+            items: {
+              type: GenAIType.OBJECT,
+              properties: {
+                id: { type: GenAIType.STRING },
+                className: { type: GenAIType.STRING }
+              },
+              required: ["id", "className"]
+            }
+          }
+        }
+      });
+
+      const suggestions = JSON.parse(response.text);
+      
+      setAnnotations(prev => prev.map(ann => {
+        const suggestion = suggestions.find((s: any) => s.id === ann.id);
+        if (suggestion) {
+          return {
+            ...ann,
+            className: suggestion.className
+          };
+        }
+        return ann;
+      }));
+      
+    } catch (err) {
+      console.error('Smart Typeset Error:', err);
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+
+  const resetCss = () => {
+    setGlobalCss(`
+/* Vivliostyle-like CSS Typesetting */
+@page {
+  size: A4;
+  margin: 0;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #f0f0f0;
+  font-family: "Noto Sans JP", sans-serif;
+}
+
+.page {
+  position: relative;
+  width: 210mm;
+  height: 297mm;
+  background-color: white;
+  margin: 20px auto;
+  box-shadow: 0 0 10px rgba(0,0,0,0.1);
+  overflow: hidden;
+  page-break-after: always;
+}
+
+@media print {
+  body { background: none; }
+  .page { margin: 0; box-shadow: none; }
+}
+
+.annotation {
+  position: absolute;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-edit {
+  background-color: white; /* Mask original text */
+}
+
+/* Custom Typesetting Classes */
+.main-title {
+  font-size: 36pt;
+  font-weight: 900;
+  text-align: center;
+  margin-top: 50mm;
+  color: #E5322E;
+}
+
+.chapter-header {
+  font-size: 24pt;
+  font-weight: bold;
+  border-bottom: 2px solid #333;
+  margin-bottom: 10mm;
+}
+
+.body-text {
+  font-size: 11pt;
+  line-height: 1.8;
+  text-align: justify;
+}
+
+.page-number {
+  position: absolute;
+  bottom: 10mm;
+  width: 100%;
+  text-align: center;
+  font-size: 9pt;
+  color: #999;
+}
+`);
+  };
+
+  const handleEditBlock = (block: TextBlock) => {
+    const newAnnotation: Annotation = {
+      id: Math.random().toString(36).substr(2, 9),
+      type: 'ai-edit',
+      page: currentPage,
+      x: block.x,
+      y: block.y,
+      width: block.width,
+      height: block.height,
+      content: block.str,
+      color: '#000000',
+      fontSize: block.fontSize || 12,
+      fontFamily: block.fontFamily || 'Arial Unicode MS',
+      textAlign: 'left'
+    };
+    setAnnotations([...annotations, newAnnotation]);
+    setSelectedId(newAnnotation.id);
+    setActiveTool('select');
+  };
+
+  useEffect(() => {
+    if (selectedId) {
+      const selected = annotations.find(a => a.id === selectedId);
+      if (selected) {
+        if (selected.color) setCurrentColor(selected.color);
+        if (selected.fontSize) setCurrentFontSize(selected.fontSize);
+        if (selected.fontFamily) setCurrentFontFamily(selected.fontFamily);
+        if (selected.textAlign) setCurrentTextAlign(selected.textAlign);
+        setIsBold(selected.fontWeight === 'bold');
+        setIsItalic(selected.fontStyle === 'italic');
+        setIsUnderline(selected.textDecoration === 'underline');
+      }
+    }
+  }, [selectedId, annotations]);
+
+  const renderPage = useCallback(async (pageNum: number, currentScale: number) => {
+    if (!pdfDoc || !canvasRef.current || pageNum < 1 || pageNum > numPages) return;
+
+    try {
+      const page = await pdfDoc.getPage(pageNum);
+      const viewport = page.getViewport({ scale: currentScale });
+      const canvas = canvasRef.current;
+      const context = canvas.getContext('2d');
+
+      if (!context) return;
+
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+
+      const renderContext = {
+        canvasContext: context,
+        viewport: viewport,
+      };
+
+      await page.render(renderContext).promise;
+      
+      // Store page as image for CSS view
+      const pageImage = canvas.toDataURL('image/jpeg', 0.8);
+      setPageImages(prev => ({ ...prev, [pageNum]: pageImage }));
+    } catch (err) {
+      console.error('Error rendering page:', err);
+      setLoadingError('Failed to render page. The PDF might be corrupted or too complex.');
+    }
+  }, [pdfDoc, numPages]);
+
+  useEffect(() => {
+    if (viewMode === 'css' && pdfDoc) {
+      const renderAll = async () => {
+        for (let i = 1; i <= numPages; i++) {
+          if (!pageImages[i]) {
+            await renderPage(i, 1.5); // Use a standard scale for background images
+          }
+        }
+      };
+      renderAll();
+    }
+  }, [viewMode, pdfDoc, numPages, pageImages, renderPage]);
+
+  const [debouncedScale, setDebouncedScale] = useState(scale);
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedScale(scale);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [scale]);
+
+  useEffect(() => {
+    if (pdfDoc) {
+      renderPage(currentPage, debouncedScale);
+    }
+  }, [pdfDoc, currentPage, debouncedScale, renderPage]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (selectedId && document.activeElement?.tagName !== 'INPUT') {
+          setAnnotations(prev => prev.filter(a => a.id !== selectedId));
+          setSelectedId(null);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedId]);
+
+  useEffect(() => {
+    const handleMouseMoveGlobal = (e: MouseEvent) => {
+      if (isDraggingAnn && selectedId && canvasRef.current) {
+        const rect = canvasRef.current.getBoundingClientRect();
+        const mouseX = (e.clientX - rect.left) / scale;
+        const mouseY = (e.clientY - rect.top) / scale;
+        
+        setAnnotations(prev => prev.map(a => 
+          a.id === selectedId 
+            ? { ...a, x: mouseX - dragOffset.x, y: mouseY - dragOffset.y } 
+            : a
+        ));
+      }
+    };
+
+    const handleMouseUpGlobal = () => {
+      setIsDraggingAnn(false);
+    };
+
+    if (isDraggingAnn) {
+      window.addEventListener('mousemove', handleMouseMoveGlobal);
+      window.addEventListener('mouseup', handleMouseUpGlobal);
+    }
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMoveGlobal);
+      window.removeEventListener('mouseup', handleMouseUpGlobal);
+    };
+  }, [isDraggingAnn, selectedId, scale, dragOffset]);
+
+  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!canvasRef.current || activeTool === 'select' || activeTool === 'hand' || activeTool === 'edit') return;
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / scale;
+    const y = (e.clientY - rect.top) / scale;
+
+    const newAnnotation: Annotation = {
+      id: Math.random().toString(36).substr(2, 9),
+      type: activeTool as any,
+      page: currentPage,
+      x,
+      y,
+      color: currentColor,
+      fontSize: activeTool === 'text' ? currentFontSize : undefined,
+      content: activeTool === 'text' ? 'New Text' : undefined,
+      width: activeTool === 'rect' || activeTool === 'circle' ? 50 : undefined,
+      height: activeTool === 'rect' || activeTool === 'circle' ? 50 : undefined,
+    };
+
+    setAnnotations([...annotations, newAnnotation]);
+    setSelectedId(newAnnotation.id);
+  };
+
+  const handleMouseDown = (e: React.MouseEvent, id: string) => {
+    if (activeTool !== 'select') return;
+    e.stopPropagation();
+    setSelectedId(id);
+    setIsDraggingAnn(true);
+    
+    const ann = annotations.find(a => a.id === id);
+    if (ann && canvasRef.current) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const mouseX = (e.clientX - rect.left) / scale;
+      const mouseY = (e.clientY - rect.top) / scale;
+      setDragOffset({
+        x: mouseX - ann.x,
+        y: mouseY - ann.y
+      });
+    }
+  };
+
+  const printCssPdf = () => {
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) return;
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Export PDF - CSS Typesetting</title>
+          <style>
+            ${globalCss}
+            body { margin: 0; padding: 0; }
+            @media print {
+              .no-print { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+          ${Array.from({ length: numPages }, (_, i) => i + 1).map(pageNum => {
+            const pageAnns = annotations.filter(a => a.page === pageNum);
+            const pageImage = pageImages[pageNum];
+            
+            return `
+              <div class="page" style="background-image: ${showBackground ? `url(${pageImage})` : 'none'}; background-size: contain; background-repeat: no-repeat;">
+                ${pageAnns.map(ann => {
+                  const style = `
+                    left: ${ann.x}px;
+                    top: ${ann.y}px;
+                    width: ${ann.width ? ann.width + 'px' : 'auto'};
+                    height: ${ann.height ? ann.height + 'px' : 'auto'};
+                    color: ${ann.color || 'black'};
+                    font-size: ${ann.fontSize || 12}px;
+                    font-family: ${ann.fontFamily || 'inherit'};
+                    text-align: ${ann.textAlign || 'left'};
+                    font-weight: ${ann.fontWeight || 'normal'};
+                    font-style: ${ann.fontStyle || 'normal'};
+                    opacity: ${ann.opacity ?? 1};
+                    ${ann.css || ''}
+                  `;
+                  
+                  if (ann.type === 'text' || ann.type === 'ai-edit') {
+                    return `<div class="annotation ${ann.type} ${ann.className || ''}" style="${style}">${ann.content || ''}</div>`;
+                  } else if (ann.type === 'rect') {
+                    return `<div class="annotation rect ${ann.className || ''}" style="${style}; border: 1px solid ${ann.color || 'black'};"></div>`;
+                  }
+                  return '';
+                }).join('')}
+              </div>
+            `;
+          }).join('')}
+          <script>
+            window.onload = () => {
+              window.print();
+              // window.close();
+            };
+          </script>
+        </body>
+      </html>
+    `;
+
+    printWindow.document.write(html);
+    printWindow.document.close();
+  };
+
+  const [isExportDropdownOpen, setIsExportDropdownOpen] = useState(false);
+
+  const exportAsImage = async (format: 'jpeg' | 'png') => {
+    if (!pdfDoc || !canvasRef.current) return;
+    
+    // Create a temporary canvas to render everything at high quality
+    const tempCanvas = document.createElement('canvas');
+    const context = tempCanvas.getContext('2d');
+    if (!context) return;
+
+    const page = await pdfDoc.getPage(currentPage);
+    const viewport = page.getViewport({ scale: 2 }); // High quality export
+    tempCanvas.width = viewport.width;
+    tempCanvas.height = viewport.height;
+
+    // Render PDF page
+    await page.render({
+      canvasContext: context,
+      viewport: viewport,
+    }).promise;
+
+    // Render annotations
+    const pageAnns = annotations.filter(a => a.page === currentPage);
+    pageAnns.forEach(ann => {
+      context.save();
+      context.translate(ann.x * 2, ann.y * 2); // Scale 2 for high quality
+      
+      if (ann.type === 'text' || ann.type === 'ai-edit') {
+        if (ann.type === 'ai-edit' && ann.width && ann.height) {
+          context.fillStyle = 'white';
+          context.fillRect(0, 0, ann.width * 2, ann.height * 2);
+        }
+        
+        context.fillStyle = ann.color || 'black';
+        const fontSize = (ann.fontSize || 12) * 2;
+        context.font = `${ann.fontWeight || 'normal'} ${ann.fontStyle || 'normal'} ${fontSize}px ${ann.fontFamily || 'sans-serif'}`;
+        context.textBaseline = 'top';
+        context.textAlign = ann.textAlign as CanvasTextAlign || 'left';
+        
+        const lines = ann.content.split('\n');
+        lines.forEach((line, i) => {
+          context.fillText(line, 0, i * fontSize * 1.2);
+        });
+      } else if (ann.type === 'rect') {
+        context.strokeStyle = ann.color || 'black';
+        context.lineWidth = 2 * 2;
+        context.strokeRect(0, 0, (ann.width || 50) * 2, (ann.height || 50) * 2);
+      } else if (ann.type === 'circle') {
+        context.strokeStyle = ann.color || 'black';
+        context.lineWidth = 2 * 2;
+        context.beginPath();
+        const radius = ((ann.width || 50) / 2) * 2;
+        context.arc(radius, radius, radius, 0, Math.PI * 2);
+        context.stroke();
+      }
+      context.restore();
+    });
+
+    const dataUrl = tempCanvas.toDataURL(`image/${format}`, 0.9);
+    const link = document.createElement('a');
+    link.href = dataUrl;
+    link.download = `exported_page_${currentPage}.${format === 'jpeg' ? 'jpg' : 'png'}`;
+    link.click();
+    setIsExportDropdownOpen(false);
+  };
+
+  const exportAsJson = () => {
+    const data = JSON.stringify(annotations, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `annotations_${pdfFile?.name || 'export'}.json`;
+    link.click();
+    setIsExportDropdownOpen(false);
+  };
+
+  const downloadPdf = async () => {
+    if (!pdfFile) return;
+
+    const existingPdfBytes = await pdfFile.arrayBuffer();
+    const pdfDoc = await PDFDocument.load(existingPdfBytes);
+    const pages = pdfDoc.getPages();
+
+    for (const ann of annotations) {
+      const page = pages[ann.page - 1];
+      if (!page) continue;
+      const { height } = page.getSize();
+
+      if ((ann.type === 'text' || ann.type === 'ai-edit') && ann.content) {
+        // For ai-edit, we use the stored properties or defaults
+        const fontSize = ann.fontSize || 12;
+        const color = ann.color ? hexToRgb(ann.color) : rgb(0, 0, 0);
+        
+        // If it's an AI edit, draw a white background to mask original text
+        if (ann.type === 'ai-edit' && ann.width && ann.height) {
+          page.drawRectangle({
+            x: ann.x,
+            y: height - ann.y - ann.height,
+            width: ann.width,
+            height: ann.height,
+            color: rgb(1, 1, 1), // White
+          });
+        }
+
+        page.drawText(ann.content, {
+          x: ann.x,
+          y: height - ann.y - fontSize,
+          size: fontSize,
+          color: color,
+        });
+      } else if (ann.type === 'rect') {
+        page.drawRectangle({
+          x: ann.x,
+          y: height - ann.y - (ann.height || 50),
+          width: ann.width || 50,
+          height: ann.height || 50,
+          borderColor: hexToRgb(ann.color),
+          borderWidth: 2,
+        });
+      } else if (ann.type === 'circle') {
+        page.drawCircle({
+          x: ann.x + (ann.width || 50) / 2,
+          y: height - ann.y - (ann.height || 50) / 2,
+          size: (ann.width || 50) / 2,
+          borderColor: hexToRgb(ann.color),
+          borderWidth: 2,
+        });
+      }
+    }
+
+    const pdfBytes = await pdfDoc.save();
+    const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `edited_${pdfFile.name}`;
+    link.click();
+  };
+
+  const hexToRgb = (hex: string) => {
+    const r = parseInt(hex.slice(1, 3), 16) / 255;
+    const g = parseInt(hex.slice(3, 5), 16) / 255;
+    const b = parseInt(hex.slice(5, 7), 16) / 255;
+    return rgb(r, g, b);
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-[#EBEBEB] font-sans text-[#333]">
+      {/* Top Navigation Bar */}
+      <nav className="h-12 bg-[#F8F9FA] border-b border-[#D1D1D1] flex items-center justify-between px-4 z-30">
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 bg-[#E5322E] rounded flex items-center justify-center text-white text-[10px] font-bold">iPDF</div>
+            <span className="font-bold text-sm">PDF Editor Pro</span>
+          </div>
+          <div className="flex items-center gap-4 text-xs font-medium text-[#666]">
+            <button className="hover:text-[#E5322E] transition-colors">PDF 結合</button>
+            <button className="hover:text-[#E5322E] transition-colors">PDF 分割</button>
+            <button className="hover:text-[#E5322E] transition-colors">PDF 圧縮</button>
+            <button className="hover:text-[#E5322E] transition-colors flex items-center gap-1">
+              PDF 変換 <ChevronRight size={12} className="rotate-90" />
+            </button>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <button className="text-xs font-medium hover:text-[#E5322E]">ログイン</button>
+          <button className="bg-[#E5322E] text-white text-xs font-bold px-4 py-1.5 rounded hover:bg-[#C42B28] transition-colors shadow-sm">
+            サインアップ
+          </button>
+          <div className="w-8 h-8 flex items-center justify-center hover:bg-[#E0E0E0] rounded cursor-pointer">
+            <Settings size={16} />
+          </div>
+        </div>
+      </nav>
+
+      {/* Sub-header Toolbar */}
+      <header className="h-10 bg-[#F3F3F3] border-b border-[#D1D1D1] flex items-center justify-between px-4 z-20">
+        <div className="flex items-center gap-1">
+          <button 
+            className={cn(
+              "flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors",
+              activeTool !== 'edit' ? "bg-white border border-[#D1D1D1] shadow-sm" : "hover:bg-[#E0E0E0]"
+            )}
+            onClick={() => setActiveTool('select')}
+          >
+            <Pen size={14} className={activeTool !== 'edit' ? "text-[#E5322E]" : ""} />
+            <span>注釈</span>
+          </button>
+          <button 
+            className={cn(
+              "flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors",
+              activeTool === 'edit' ? "bg-white border border-[#D1D1D1] shadow-sm" : "hover:bg-[#E0E0E0]"
+            )}
+            onClick={() => setActiveTool('edit')}
+          >
+            <Layers size={14} className={activeTool === 'edit' ? "text-[#E5322E]" : ""} />
+            <span>編集する</span>
+            <div className="w-3 h-3 bg-yellow-400 rounded-full flex items-center justify-center text-[8px] text-black">👑</div>
+          </button>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-1 bg-white border border-[#D1D1D1] rounded px-2 py-0.5 shadow-sm">
+            <button 
+              onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+              className="p-1 hover:bg-[#F0F0F0] rounded disabled:opacity-30"
+              disabled={currentPage === 1}
+            >
+              <ChevronLeft size={14} />
+            </button>
+            <div className="flex items-center gap-1 text-xs font-medium">
+              <input 
+                type="text" 
+                value={currentPage} 
+                className="w-8 text-center border border-[#D1D1D1] rounded"
+                readOnly
+              />
+              <span>/ {numPages || 1}</span>
+            </div>
+            <button 
+              onClick={() => setCurrentPage(Math.min(numPages, currentPage + 1))}
+              className="p-1 hover:bg-[#F0F0F0] rounded disabled:opacity-30"
+              disabled={currentPage === numPages}
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
+          <div className="h-4 w-[1px] bg-[#D1D1D1]" />
+          <div className="flex items-center gap-2">
+            <button onClick={() => setScale(Math.max(0.5, scale - 0.1))} className="p-1 hover:bg-[#E0E0E0] rounded"><ZoomOut size={16} /></button>
+            <span className="text-xs font-medium w-10 text-center">{Math.round(scale * 100)}%</span>
+            <button onClick={() => setScale(Math.min(3, scale + 0.1))} className="p-1 hover:bg-[#E0E0E0] rounded"><ZoomIn size={16} /></button>
+          </div>
+          <div className="h-4 w-[1px] bg-[#D1D1D1]" />
+          <button className="p-1 hover:bg-[#E0E0E0] rounded"><Maximize size={16} /></button>
+          <button className="p-1 hover:bg-[#E0E0E0] rounded"><Search size={16} /></button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 bg-[#F0F0F0] p-1 rounded mr-4">
+            <button 
+              onClick={() => setViewMode('canvas')}
+              className={cn(
+                "px-3 py-1 text-[10px] font-bold rounded transition-all",
+                viewMode === 'canvas' ? "bg-white shadow-sm text-[#E5322E]" : "text-[#666] hover:text-[#333]"
+              )}
+            >
+              エディタ
+            </button>
+            <button 
+              onClick={() => setViewMode('css')}
+              className={cn(
+                "px-3 py-1 text-[10px] font-bold rounded transition-all",
+                viewMode === 'css' ? "bg-white shadow-sm text-[#E5322E]" : "text-[#666] hover:text-[#333]"
+              )}
+            >
+              CSS組版
+            </button>
+          </div>
+
+          {viewMode === 'css' && (
+            <button 
+              onClick={printCssPdf}
+              className="bg-[#2E7D32] text-white text-xs font-bold px-4 py-1.5 rounded hover:bg-[#1B5E20] transition-all shadow-md flex items-center gap-2"
+            >
+              <Maximize size={14} /> PDF出力 (CSS)
+            </button>
+          )}
+
+          <div className="relative">
+            <button 
+              onClick={() => setIsExportDropdownOpen(!isExportDropdownOpen)}
+              disabled={!pdfFile}
+              className="bg-[#E5322E] text-white text-xs font-bold px-6 py-1.5 rounded hover:bg-[#C42B28] transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+            >
+              エクスポート <ChevronRight size={14} className={cn("transition-transform", isExportDropdownOpen && "rotate-90")} />
+            </button>
+
+            <AnimatePresence>
+              {isExportDropdownOpen && (
+                <motion.div 
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                  className="absolute right-0 mt-2 w-48 bg-white border border-[#D1D1D1] rounded-xl shadow-2xl z-50 overflow-hidden"
+                >
+                  <div className="p-2 space-y-1">
+                    <button 
+                      onClick={() => { downloadPdf(); setIsExportDropdownOpen(false); }}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-[#333] hover:bg-red-50 hover:text-[#E5322E] rounded-lg transition-colors"
+                    >
+                      <FileText size={14} /> PDFとして保存
+                    </button>
+                    <div className="h-[1px] bg-[#F0F0F0] mx-2" />
+                    <button 
+                      onClick={() => exportAsImage('jpeg')}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-[#333] hover:bg-red-50 hover:text-[#E5322E] rounded-lg transition-colors"
+                    >
+                      <Image size={14} /> JPGとして保存 (現ページ)
+                    </button>
+                    <button 
+                      onClick={() => exportAsImage('png')}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-[#333] hover:bg-red-50 hover:text-[#E5322E] rounded-lg transition-colors"
+                    >
+                      <ImageIcon size={14} /> PNGとして保存 (現ページ)
+                    </button>
+                    <div className="h-[1px] bg-[#F0F0F0] mx-2" />
+                    <button 
+                      onClick={exportAsJson}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-xs font-bold text-[#333] hover:bg-red-50 hover:text-[#E5322E] rounded-lg transition-colors"
+                    >
+                      <Database size={14} /> JSON (アノテーション)
+                    </button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <div className="flex flex-1 overflow-hidden relative">
+        <Sidebar 
+          isSidebarOpen={isSidebarOpen}
+          setIsSidebarOpen={setIsSidebarOpen}
+          numPages={numPages}
+          currentPage={currentPage}
+          setCurrentPage={setCurrentPage}
+          pdfDoc={pdfDoc}
+          annotations={annotations}
+        />
+
+        {comparingVersion && (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 bg-yellow-500 text-white px-6 py-2 rounded-full shadow-2xl z-50 flex items-center gap-4 border-2 border-white">
+            <div className="flex items-center gap-2">
+              <Sparkles size={16} />
+              <span className="text-xs font-bold">比較モード: {comparingVersion.name}</span>
+            </div>
+            <div className="h-4 w-[1px] bg-white/30" />
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 bg-green-400 rounded-full" />
+                <span className="text-[10px]">追加</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 bg-red-400 rounded-full" />
+                <span className="text-[10px]">削除</span>
+              </div>
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 bg-yellow-400 rounded-full" />
+                <span className="text-[10px]">変更</span>
+              </div>
+            </div>
+            <button 
+              onClick={() => setComparingVersion(null)}
+              className="bg-white text-yellow-600 px-3 py-1 rounded-full text-[10px] font-bold hover:bg-yellow-50 transition-colors"
+            >
+              終了
+            </button>
+          </div>
+        )}
+
+        {!isSidebarOpen && (
+          <button 
+            onClick={() => setIsSidebarOpen(true)}
+            className="absolute top-4 left-0 bg-white border border-[#D1D1D1] border-l-0 rounded-r-lg p-2 shadow-md z-10 hover:bg-[#F0F0F0] transition-all"
+          >
+            <ChevronRight size={16} />
+          </button>
+        )}
+
+        {/* Editor Workspace */}
+        <main className="flex-1 flex flex-col relative bg-[#EBEBEB] overflow-hidden">
+          {viewMode === 'canvas' ? (
+            <>
+              <ToolPalette 
+                activeTool={activeTool}
+                setActiveTool={setActiveTool}
+                detectTextAI={detectTextAI}
+                currentColor={currentColor}
+                currentFontSize={currentFontSize}
+              />
+
+              {/* PDF Canvas */}
+              <div 
+                ref={containerRef}
+                className="flex-1 overflow-auto p-16 flex justify-center items-start scrollbar-hide"
+                style={{ cursor: activeTool === 'hand' ? 'grab' : 'default' }}
+              >
+                {!pdfFile ? (
+                  <div className="flex flex-col items-center justify-center h-full gap-8 max-w-lg text-center">
+                    <div className={cn(
+                      "w-32 h-32 rounded-full flex items-center justify-center transition-all shadow-inner",
+                      loadingError ? "bg-red-50 text-red-600" : "bg-white text-[#E5322E]"
+                    )}>
+                      {isLoading ? (
+                        <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}>
+                          <Save size={64} strokeWidth={1} />
+                        </motion.div>
+                      ) : loadingError ? (
+                        <AlertCircle size={64} strokeWidth={1} />
+                      ) : (
+                        <FileUp size={64} strokeWidth={1} />
+                      )}
+                    </div>
+                    <div>
+                      <h3 className="text-3xl font-bold mb-3 tracking-tight">
+                        {isLoading ? "PDFを読み込み中..." : loadingError ? "エラーが発生しました" : "PDFを編集"}
+                      </h3>
+                      <p className="text-[#666] text-sm leading-relaxed">
+                        {loadingError || "ファイルをここにドラッグ＆ドロップするか、下のボタンから選択してください。テキストの追加、図形の描画、注釈の作成が可能です。"}
+                      </p>
+                    </div>
+                    <div className="flex gap-4">
+                      <button 
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={isLoading}
+                        className="bg-[#E5322E] text-white px-10 py-3.5 rounded-full font-bold text-lg hover:bg-[#C42B28] transition-all shadow-xl hover:shadow-[#E5322E]/20 disabled:opacity-50"
+                      >
+                        {isLoading ? "処理中..." : "ファイルを選択"}
+                      </button>
+                      {loadingError && (
+                        <button 
+                          onClick={() => { setLoadingError(null); setPdfFile(null); }}
+                          className="bg-white text-[#333] border border-[#D1D1D1] px-10 py-3.5 rounded-full font-bold text-lg hover:bg-[#F0F0F0] transition-all shadow-sm"
+                        >
+                          リセット
+                        </button>
+                      )}
+                    </div>
+                    <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="application/pdf" className="hidden" />
+                  </div>
+                ) : (
+                  <div className="relative shadow-[0_20px_50px_rgba(0,0,0,0.2)] bg-white">
+                    <canvas ref={canvasRef} onClick={handleCanvasClick} className="block" />
+                    
+                    {/* AI Mapping Loading Overlay */}
+                    {isDetecting && (
+                      <div className="absolute inset-0 bg-white/80 backdrop-blur-md flex flex-col items-center justify-center z-10">
+                        <div className="w-full max-w-md px-12 space-y-8 text-center">
+                          <div className="relative inline-block">
+                            <motion.div 
+                              animate={{ rotate: 360 }} 
+                              transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+                              className="text-[#E5322E]"
+                            >
+                              <Sparkles size={64} strokeWidth={1.5} />
+                            </motion.div>
+                            <motion.div 
+                              initial={{ scale: 0.8, opacity: 0 }}
+                              animate={{ scale: 1, opacity: 1 }}
+                              className="absolute -top-2 -right-2 bg-[#E5322E] text-white text-[10px] font-bold px-2 py-0.5 rounded-full"
+                            >
+                              AI
+                            </motion.div>
+                          </div>
+
+                          <div className="space-y-2">
+                            <h4 className="text-xl font-bold text-[#333] tracking-tight">
+                              {scanPhase === 'doc-ai' && "Document AI で原本を検出中..."}
+                              {scanPhase === 'gemini-correction' && "Gemini で調整・補正中..."}
+                              {scanPhase === 'polishing' && "最終レイアウト調整中..."}
+                            </h4>
+                            <p className="text-xs text-[#666]">
+                              {scanPhase === 'doc-ai' && "Google Cloud Document AI がテキスト構造を厳密に抽出しています"}
+                              {scanPhase === 'gemini-correction' && "Gemini が原本画像と照合し、100%の精度へ補正しています"}
+                              {scanPhase === 'polishing' && "ミリ単位の位置調整とフォントの最適化を行っています"}
+                            </p>
+                          </div>
+
+                          <div className="space-y-3">
+                            <div className="flex justify-between text-[10px] font-bold uppercase tracking-widest text-[#999]">
+                              <span>進捗状況: {Math.round(scanProgress)}%</span>
+                              <span>残り約 {timeRemaining} 秒</span>
+                            </div>
+                            <div className="h-2 bg-[#F0F0F0] rounded-full overflow-hidden border border-[#D1D1D1]">
+                              <motion.div 
+                                className="h-full bg-gradient-to-r from-[#E5322E] to-[#FF6B6B]"
+                                initial={{ width: 0 }}
+                                animate={{ width: `${scanProgress}%` }}
+                                transition={{ ease: "easeOut" }}
+                              />
+                            </div>
+                            <div className="flex justify-center gap-4">
+                              <div className="flex items-center gap-1.5">
+                                <div className={cn("w-1.5 h-1.5 rounded-full", scanPhase === 'doc-ai' || scanPhase === 'gemini-correction' || scanPhase === 'polishing' ? "bg-[#E5322E]" : "bg-[#D1D1D1]")} />
+                                <span className="text-[9px] text-[#999]">Document AI 検出</span>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <div className={cn("w-1.5 h-1.5 rounded-full", scanPhase === 'gemini-correction' || scanPhase === 'polishing' ? "bg-[#E5322E]" : "bg-[#D1D1D1]")} />
+                                <span className="text-[9px] text-[#999]">Gemini 調整・補正</span>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <div className={cn("w-1.5 h-1.5 rounded-full", scanPhase === 'polishing' ? "bg-[#E5322E]" : "bg-[#D1D1D1]")} />
+                                <span className="text-[9px] text-[#999]">最終調整</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                        
+                        {/* Scanning Line Animation */}
+                        <motion.div 
+                          className="absolute left-0 right-0 h-[2px] bg-[#E5322E] shadow-[0_0_15px_rgba(229,50,46,0.8)] z-20"
+                          animate={{ top: ['0%', '100%', '0%'] }}
+                          transition={{ repeat: Infinity, duration: 4, ease: "linear" }}
+                        />
+                      </div>
+                    )}
+
+                    {/* Manual Mapping Trigger Overlay */}
+                    {activeTool === 'edit' && !isDetecting && annotations.filter(a => a.page === currentPage && a.type === 'ai-edit').length === 0 && (
+                      <div className="absolute inset-0 bg-black/5 flex flex-col items-center justify-center z-10 pointer-events-none">
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            detectTextAI();
+                          }}
+                          className="pointer-events-auto bg-white/90 backdrop-blur border border-[#E5322E] text-[#E5322E] px-8 py-4 rounded-2xl shadow-2xl hover:bg-[#E5322E] hover:text-white transition-all flex flex-col items-center gap-2 group"
+                        >
+                          <Sparkles size={32} className="group-hover:scale-110 transition-transform" />
+                          <div className="text-center">
+                            <p className="font-bold text-lg">このページをマッピング</p>
+                            <p className="text-[10px] opacity-70">AIがテキストを編集可能にします</p>
+                          </div>
+                        </button>
+                      </div>
+                    )}
+                    
+                    {/* Annotations Layer */}
+                    <div className="absolute inset-0 pointer-events-none" style={{ width: canvasRef.current?.width, height: canvasRef.current?.height }}>
+                      {/* Comparison Overlay (Old Version) */}
+                      {comparingVersion && (
+                        <div className="absolute inset-0 opacity-40 pointer-events-none">
+                          {comparingVersion.annotations.filter((a: any) => a.page === currentPage).map((ann: any) => {
+                            const currentAnn = annotations.find(curr => curr.id === ann.id);
+                            const isRemoved = !currentAnn;
+                            const isModified = currentAnn && (
+                              currentAnn.content !== ann.content || 
+                              currentAnn.x !== ann.x || 
+                              currentAnn.y !== ann.y
+                            );
+
+                            if (!isRemoved && !isModified) return null;
+
+                            return (
+                              <div 
+                                key={`comp-${ann.id}`}
+                                className={cn(
+                                  "absolute border-2 border-dashed",
+                                  isRemoved ? "border-red-500 bg-red-100/30" : "border-yellow-500 bg-yellow-100/30"
+                                )}
+                                style={{ 
+                                  left: ann.x * scale, 
+                                  top: ann.y * scale,
+                                  color: ann.color,
+                                  fontSize: ann.fontSize ? ann.fontSize * scale : undefined,
+                                  width: ann.width ? ann.width * scale : undefined,
+                                  height: ann.height ? ann.height * scale : undefined,
+                                  borderRadius: ann.type === 'circle' ? '50%' : undefined,
+                                  padding: ann.type === 'text' ? '2px 4px' : undefined,
+                                }}
+                              >
+                                <div className="absolute -top-4 left-0 bg-black text-white text-[8px] px-1 rounded whitespace-nowrap">
+                                  {isRemoved ? "削除済み" : "変更前"}
+                                </div>
+                                {ann.content}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {/* Current Annotations */}
+                      {annotations.filter(a => a.page === currentPage).map((ann) => {
+                        const oldAnn = comparingVersion?.annotations.find((old: any) => old.id === ann.id);
+                        const isAdded = comparingVersion && !oldAnn;
+                        const isModified = comparingVersion && oldAnn && (
+                          oldAnn.content !== ann.content || 
+                          oldAnn.x !== ann.x || 
+                          oldAnn.y !== ann.y
+                        );
+
+                        return (
+                          <div 
+                            key={ann.id}
+                            className={cn(
+                              "absolute pointer-events-auto",
+                              selectedId === ann.id && "ring-2 ring-[#E5322E] ring-offset-2",
+                              activeTool === 'select' ? "cursor-move" : "cursor-default",
+                              isAdded && "ring-2 ring-green-500 ring-offset-1 bg-green-50/20",
+                              isModified && "ring-2 ring-yellow-500 ring-offset-1 bg-yellow-50/20"
+                            )}
+                            style={{ 
+                              left: ann.x * scale, 
+                              top: ann.y * scale,
+                              color: ann.color,
+                              fontSize: ann.fontSize ? ann.fontSize * scale : undefined,
+                              width: ann.width ? ann.width * scale : undefined,
+                              height: ann.height ? ann.height * scale : undefined,
+                              border: ann.type === 'rect' ? `2px solid ${ann.color}` : undefined,
+                              borderRadius: ann.type === 'circle' ? '50%' : undefined,
+                              borderColor: ann.type === 'circle' ? ann.color : undefined,
+                              borderStyle: ann.type === 'circle' ? 'solid' : undefined,
+                              borderWidth: ann.type === 'circle' ? '2px' : undefined,
+                              padding: ann.type === 'text' ? '2px 4px' : undefined,
+                            }}
+                            onMouseDown={(e) => handleMouseDown(e, ann.id)}
+                          >
+                            {comparingVersion && (isAdded || isModified) && (
+                              <div className={cn(
+                                "absolute -top-4 left-0 text-white text-[8px] px-1 rounded whitespace-nowrap z-10",
+                                isAdded ? "bg-green-600" : "bg-yellow-600"
+                              )}>
+                                {isAdded ? "新規追加" : "変更後"}
+                              </div>
+                            )}
+                            {ann.type === 'text' && (
+                              <textarea 
+                                value={ann.content} 
+                                onChange={(e) => setAnnotations(annotations.map(a => a.id === ann.id ? { ...a, content: e.target.value } : a))}
+                                className="bg-transparent border-none outline-none w-full font-medium resize-none overflow-hidden"
+                                style={{ 
+                                  fontSize: 'inherit', 
+                                  color: 'inherit',
+                                  fontWeight: ann.fontWeight || (isBold ? 'bold' : 'normal'),
+                                  fontStyle: ann.fontStyle || (isItalic ? 'italic' : 'normal'),
+                                  textDecoration: ann.textDecoration || (isUnderline ? 'underline' : 'none'),
+                                  textAlign: ann.textAlign || currentTextAlign,
+                                  fontFamily: ann.fontFamily || currentFontFamily
+                                }}
+                                rows={1}
+                                onInput={(e) => {
+                                  const target = e.target as HTMLTextAreaElement;
+                                  target.style.height = 'auto';
+                                  target.style.height = target.scrollHeight + 'px';
+                                }}
+                              />
+                            )}
+                            {ann.type === 'ai-edit' && (
+                              <textarea 
+                                value={ann.content} 
+                                onChange={(e) => setAnnotations(annotations.map(a => a.id === ann.id ? { ...a, content: e.target.value } : a))}
+                                className="bg-white border-none outline-none w-full resize-none overflow-hidden"
+                                style={{ 
+                                  fontSize: 'inherit', 
+                                  color: 'inherit',
+                                  fontWeight: ann.fontWeight === 'bold' ? 'bold' : 'normal',
+                                  fontStyle: ann.fontStyle || 'normal',
+                                  textDecoration: ann.textDecoration || 'none',
+                                  textAlign: ann.textAlign || 'left',
+                                  fontFamily: ann.fontFamily || 'Noto Sans JP',
+                                  minWidth: ann.width ? ann.width * scale : '100px',
+                                  lineHeight: 1.1,
+                                  padding: 0,
+                                  margin: 0
+                                }}
+                                rows={1}
+                                onInput={(e) => {
+                                  const target = e.target as HTMLTextAreaElement;
+                                  target.style.height = 'auto';
+                                  target.style.height = target.scrollHeight + 'px';
+                                }}
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="flex-1 flex overflow-hidden">
+              {/* CSS Editor Panel */}
+              <div className="w-96 bg-[#2D2D2D] text-white flex flex-col border-r border-black shadow-2xl z-20">
+                <div className="p-4 border-b border-black flex items-center justify-between bg-[#1E1E1E]">
+                  <div className="flex items-center gap-2">
+                    <Layers size={16} className="text-[#E5322E]" />
+                    <span className="text-xs font-bold uppercase tracking-widest">Global CSS (Typesetting)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      onClick={() => setShowBackground(!showBackground)}
+                      className={cn(
+                        "text-[9px] font-bold px-2 py-1 rounded border transition-all",
+                        showBackground ? "bg-[#E5322E] border-[#E5322E] text-white" : "bg-transparent border-[#666] text-[#666]"
+                      )}
+                    >
+                      原本を表示: {showBackground ? "ON" : "OFF"}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex-1 relative">
+                  <textarea 
+                    value={globalCss}
+                    onChange={(e) => setGlobalCss(e.target.value)}
+                    className="absolute inset-0 w-full h-full bg-[#1E1E1E] text-[#D4D4D4] p-6 font-mono text-xs outline-none resize-none leading-relaxed"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="p-4 bg-[#1E1E1E] border-t border-black flex flex-col gap-2">
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={smartTypesetAI}
+                      disabled={isDetecting}
+                      className="flex-1 bg-[#E5322E] text-white text-[10px] font-bold py-2 rounded hover:bg-[#C42B28] transition-all flex items-center justify-center gap-2"
+                    >
+                      <Sparkles size={12} /> AI 組版アシスト
+                    </button>
+                    <button 
+                      onClick={resetCss}
+                      className="px-3 bg-[#333] text-white text-[10px] font-bold py-2 rounded hover:bg-[#444] transition-all"
+                    >
+                      リセット
+                    </button>
+                  </div>
+                  <p className="text-[9px] text-[#666]">@page ルールや .page, .annotation クラスを編集して、PDFのレイアウトをカスタマイズできます。</p>
+                </div>
+              </div>
+
+              {/* Paged Media Preview */}
+              <div className="flex-1 bg-[#404040] overflow-auto p-12 flex flex-col items-center gap-12 scrollbar-hide">
+                <style>{globalCss}</style>
+                {Array.from({ length: numPages }, (_, i) => i + 1).map(pageNum => (
+                  <div 
+                    key={pageNum} 
+                    className="page"
+                    style={{ 
+                      backgroundImage: showBackground ? `url(${pageImages[pageNum]})` : 'none',
+                      backgroundSize: 'contain',
+                      backgroundRepeat: 'no-repeat'
+                    }}
+                  >
+                    {annotations.filter(a => a.page === pageNum).map(ann => (
+                      <div 
+                        key={ann.id}
+                        className={cn("annotation", ann.type, ann.className, selectedId === ann.id && "ring-2 ring-[#E5322E] ring-offset-2")}
+                        onClick={(e) => { e.stopPropagation(); setSelectedId(ann.id); }}
+                        style={{ 
+                          left: ann.x, 
+                          top: ann.y,
+                          width: ann.width,
+                          height: ann.height,
+                          color: ann.color,
+                          fontSize: ann.fontSize,
+                          fontFamily: ann.fontFamily,
+                          textAlign: ann.textAlign,
+                          fontWeight: ann.fontWeight,
+                          fontStyle: ann.fontStyle,
+                          textDecoration: ann.textDecoration,
+                          opacity: ann.opacity ?? 1,
+                          cursor: 'pointer',
+                          ...(ann.css ? Object.fromEntries(ann.css.split(';').filter(s => s.trim()).map(s => {
+                            const [k, v] = s.split(':');
+                            if (!k || !v) return [];
+                            return [k.trim().replace(/-([a-z])/g, g => g[1].toUpperCase()), v.trim()];
+                          }).filter(pair => pair.length === 2)) : {})
+                        }}
+                      >
+                        {(ann.type === 'text' || ann.type === 'ai-edit') && (
+                          <div 
+                            contentEditable 
+                            suppressContentEditableWarning
+                            onBlur={(e) => {
+                              const newContent = e.currentTarget.textContent || '';
+                              setAnnotations(prev => prev.map(a => a.id === ann.id ? { ...a, content: newContent } : a));
+                            }}
+                            className="outline-none w-full h-full"
+                          >
+                            {ann.content}
+                          </div>
+                        )}
+                        {ann.type === 'rect' && (
+                          <div style={{ width: '100%', height: '100%', border: `1px solid ${ann.color}` }} />
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </main>
+
+        {/* Right Sidebar - Properties & Tools */}
+        <PropertiesPanel 
+          selectedId={selectedId}
+          annotations={annotations}
+          setAnnotations={setAnnotations}
+          setSelectedId={setSelectedId}
+          currentFontFamily={currentFontFamily}
+          setCurrentFontFamily={setCurrentFontFamily}
+          currentFontSize={currentFontSize}
+          setCurrentFontSize={setCurrentFontSize}
+          isBold={isBold}
+          setIsBold={setIsBold}
+          isItalic={isItalic}
+          setIsItalic={setIsItalic}
+          isUnderline={isUnderline}
+          setIsUnderline={setIsUnderline}
+          currentTextAlign={currentTextAlign}
+          setCurrentTextAlign={setCurrentTextAlign}
+          currentColor={currentColor}
+          setCurrentColor={setCurrentColor}
+          isDetecting={isDetecting}
+          detectTextAI={detectTextAI}
+          smartFormatAI={smartFormatAI}
+          currentPage={currentPage}
+          downloadPdf={downloadPdf}
+          printCssPdf={printCssPdf}
+          viewMode={viewMode}
+          pdfFile={pdfFile}
+          user={user}
+          login={login}
+          isVersionHistoryOpen={isVersionHistoryOpen}
+          setIsVersionHistoryOpen={setIsVersionHistoryOpen}
+          versions={versions}
+          revertToVersion={revertToVersion}
+          deleteVersion={deleteVersion}
+          saveVersion={saveVersion}
+          versionName={versionName}
+          setVersionName={setVersionName}
+          isSavingVersion={isSavingVersion}
+          comparingVersionId={comparingVersion?.id}
+          toggleCompareVersion={toggleCompareVersion}
+          processorId={processorId}
+          setProcessorId={setProcessorId}
+          projectId={projectId}
+          setProjectId={setProjectId}
+        />
+      </div>
+
+      {/* Footer / Status Bar */}
+      <footer className="h-7 bg-white border-t border-[#D1D1D1] flex items-center justify-between px-4 text-[10px] text-[#999] z-30">
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-1.5">
+            <div className="w-2 h-2 bg-green-500 rounded-full shadow-[0_0_5px_rgba(34,197,94,0.5)]" />
+            <span className="font-medium">AI Engine Online</span>
+          </div>
+          <div className="h-3 w-[1px] bg-[#D1D1D1]" />
+          <span className="truncate max-w-[200px]">{pdfFile?.name || '待機中'}</span>
+          {pdfFile && <span>({(pdfFile.size / 1024 / 1024).toFixed(2)} MB)</span>}
+        </div>
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-3">
+            <span>ページ: <span className="text-[#333] font-bold">{currentPage}</span> / {numPages || 0}</span>
+            <span>ズーム: <span className="text-[#333] font-bold">{Math.round(scale * 100)}%</span></span>
+          </div>
+          <div className="h-3 w-[1px] bg-[#D1D1D1]" />
+          <div className="flex items-center gap-1.5">
+            <div className="w-3.5 h-3.5 bg-[#E5322E] rounded flex items-center justify-center text-[7px] text-white font-black">i</div>
+            <span className="font-bold text-[#666]">iPDF Editor Pro</span>
+            <span className="bg-[#F0F0F0] px-1 rounded text-[8px]">v1.2.0</span>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}

@@ -1,0 +1,42 @@
+{
+  "entities": {
+    "Version": {
+      "title": "Version",
+      "description": "A saved version of a PDF document's edits.",
+      "type": "object",
+      "properties": {
+        "documentId": {
+          "type": "string",
+          "description": "The unique identifier for the PDF document."
+        },
+        "name": {
+          "type": "string",
+          "description": "The name given to this version."
+        },
+        "annotations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "The list of annotations (edits) in this version."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The timestamp when this version was created."
+        },
+        "uid": {
+          "type": "string",
+          "description": "The user ID of the person who created this version."
+        }
+      },
+      "required": ["documentId", "name", "annotations", "createdAt", "uid"]
+    }
+  },
+  "firestore": {
+    "/versions/{versionId}": {
+      "schema": "Version",
+      "description": "Collection of saved document versions."
+    }
+  }
+}
