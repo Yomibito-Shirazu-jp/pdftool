@@ -57,7 +57,7 @@ async function startServer() {
   // API: Document AI Detection
   app.post("/api/detect", async (req, res) => {
     try {
-      const { image, processorId, projectId, location } = req.body;
+      const { image, processorId, projectId, location, mimeType, pageNumber } = req.body;
       
       const effectiveProjectId = projectId || process.env.GOOGLE_CLOUD_PROJECT_ID;
       const effectiveLocation = location || process.env.GOOGLE_CLOUD_LOCATION || "us";
@@ -82,7 +82,6 @@ async function startServer() {
       if (credentials) clientOptions.credentials = credentials;
       if (effectiveProjectId) clientOptions.projectId = effectiveProjectId;
       
-      // us 以外の場合はリージョン指定のエンドポイントが必要
       if (effectiveLocation && effectiveLocation !== 'us') {
         clientOptions.apiEndpoint = `${effectiveLocation}-documentai.googleapis.com`;
       }
@@ -90,77 +89,78 @@ async function startServer() {
       const regionalClient = new DocumentProcessorServiceClient(clientOptions);
       const name = `projects/${effectiveProjectId}/locations/${effectiveLocation}/processors/${effectiveProcessorId}`;
       
-      const request = {
+      // Detect MIME type: prefer PDF over PNG for better accuracy
+      const effectiveMimeType = mimeType || "image/png";
+      
+      const request: any = {
         name,
         rawDocument: {
           content: image,
-          mimeType: "image/png",
+          mimeType: effectiveMimeType,
         },
+        // Layout Parser options for better Japanese OCR
+        processOptions: {
+          ocrConfig: {
+            enableNativePdfParsing: effectiveMimeType === "application/pdf",
+            language: "ja",
+            advancedOcrOptions: ["ENABLE_IMAGE_QUALITY_SCORES"],
+          },
+          // Process specific page if requested
+          ...(pageNumber && effectiveMimeType === "application/pdf" ? {
+            individualPageSelector: { pages: [pageNumber] }
+          } : {})
+        }
       };
 
       const [result] = await regionalClient.processDocument(request);
       const { document } = result;
-      console.log("Document AI processing completed successfully.");
+      console.log(`Document AI completed. Pages: ${document?.pages?.length}, Text length: ${document?.text?.length}`);
 
-      // Extract layout and text with fallback mechanisms
+      // Extract blocks from ALL pages
       let blocks: any[] = [];
 
-      const page = document?.pages?.[0];
-      if (page) {
-        // Try paragraphs first (standard for text blocks)
-        if (page.paragraphs && page.paragraphs.length > 0) {
-          blocks = page.paragraphs.map((p: any) => {
-            const vertices = p.layout?.boundingPoly?.normalizedVertices || [];
-            const ymin = Math.min(...vertices.map((v: any) => v.y)) * 1000;
-            const xmin = Math.min(...vertices.map((v: any) => v.x)) * 1000;
-            const ymax = Math.max(...vertices.map((v: any) => v.y)) * 1000;
-            const xmax = Math.max(...vertices.map((v: any) => v.x)) * 1000;
-            
-            const text = document.text?.substring(
-              p.layout?.textAnchor?.textSegments?.[0]?.startIndex || 0,
-              p.layout?.textAnchor?.textSegments?.[0]?.endIndex || 0
-            ).trim();
+      const pages = document?.pages || [];
+      for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+        const page = pages[pageIdx];
+        const currentPageNum = pageNumber || (pageIdx + 1);
 
-            return { text, box: [ymin, xmin, ymax, xmax] };
-          });
-        } 
-        // Fallback to lines if no paragraphs
-        else if (page.lines && page.lines.length > 0) {
-          blocks = page.lines.map((l: any) => {
-            const vertices = l.layout?.boundingPoly?.normalizedVertices || [];
-            const ymin = Math.min(...vertices.map((v: any) => v.y)) * 1000;
-            const xmin = Math.min(...vertices.map((v: any) => v.x)) * 1000;
-            const ymax = Math.max(...vertices.map((v: any) => v.y)) * 1000;
-            const xmax = Math.max(...vertices.map((v: any) => v.x)) * 1000;
+        // Prefer blocks > paragraphs > lines for layout accuracy
+        const elements = page.blocks?.length ? page.blocks
+          : page.paragraphs?.length ? page.paragraphs
+          : page.lines?.length ? page.lines
+          : page.visualElements || [];
 
-            const text = document.text?.substring(
-              l.layout?.textAnchor?.textSegments?.[0]?.startIndex || 0,
-              l.layout?.textAnchor?.textSegments?.[0]?.endIndex || 0
-            ).trim();
+        for (const el of elements) {
+          const vertices = el.layout?.boundingPoly?.normalizedVertices || [];
+          if (vertices.length === 0) continue;
 
-            return { text, box: [ymin, xmin, ymax, xmax] };
-          });
-        }
-        // Fallback to visual elements (some specialized processors use this)
-        else if (page.visualElements && page.visualElements.length > 0) {
-          blocks = page.visualElements.map((el: any) => {
-            const vertices = el.layout?.boundingPoly?.normalizedVertices || [];
-            const ymin = Math.min(...vertices.map((v: any) => v.y)) * 1000;
-            const xmin = Math.min(...vertices.map((v: any) => v.x)) * 1000;
-            const ymax = Math.max(...vertices.map((v: any) => v.y)) * 1000;
-            const xmax = Math.max(...vertices.map((v: any) => v.x)) * 1000;
+          const ymin = Math.min(...vertices.map((v: any) => v.y ?? 0)) * 1000;
+          const xmin = Math.min(...vertices.map((v: any) => v.x ?? 0)) * 1000;
+          const ymax = Math.max(...vertices.map((v: any) => v.y ?? 0)) * 1000;
+          const xmax = Math.max(...vertices.map((v: any) => v.x ?? 0)) * 1000;
 
-            const text = document.text?.substring(
-              el.layout?.textAnchor?.textSegments?.[0]?.startIndex || 0,
-              el.layout?.textAnchor?.textSegments?.[0]?.endIndex || 0
-            ).trim();
+          // Extract text from textAnchor segments
+          let text = '';
+          const segments = el.layout?.textAnchor?.textSegments || [];
+          for (const seg of segments) {
+            const start = Number(seg.startIndex || 0);
+            const end = Number(seg.endIndex || 0);
+            text += document?.text?.substring(start, end) || '';
+          }
+          text = text.trim();
 
-            return { text, box: [ymin, xmin, ymax, xmax] };
-          });
+          if (text.length > 0) {
+            blocks.push({
+              text,
+              box: [ymin, xmin, ymax, xmax],
+              page: currentPageNum,
+              confidence: el.layout?.confidence || 0
+            });
+          }
         }
       }
 
-      res.json({ blocks: blocks.filter(b => b.text && b.text.length > 0) });
+      res.json({ blocks, pageCount: pages.length, fullText: document?.text });
     } catch (error: any) {
       console.error("Document AI Error Details:", {
         message: error.message,

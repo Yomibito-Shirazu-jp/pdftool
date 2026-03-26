@@ -589,7 +589,7 @@ body {
       
       const imageData = offscreenCanvas.toDataURL('image/png').split(',')[1];
       
-      // --- PHASE 1: Document AI Detection ---
+      // --- PHASE 1: Document AI Detection (send PDF raw bytes for max accuracy) ---
       let docAIBlocks = [];
       
       // Only run Document AI for full page detection
@@ -599,11 +599,25 @@ body {
           setScanProgress(5);
           
           try {
+            // Send raw PDF bytes instead of PNG screenshot
+            let pdfBase64 = '';
+            if (pdfFile) {
+              const buf = await pdfFile.arrayBuffer();
+              const bytes = new Uint8Array(buf);
+              let binary = '';
+              for (let i = 0; i < bytes.length; i++) {
+                binary += String.fromCharCode(bytes[i]);
+              }
+              pdfBase64 = btoa(binary);
+            }
+
             const docAIResponse = await fetchWithRetry('/api/detect', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ 
-                image: imageData,
+                image: pdfBase64 || imageData,
+                mimeType: pdfBase64 ? 'application/pdf' : 'image/png',
+                pageNumber: currentPage,
                 processorId: processorId,
                 projectId: projectId,
                 location: location
