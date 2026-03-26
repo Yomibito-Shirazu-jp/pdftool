@@ -1,5 +1,5 @@
 import React from 'react';
-import { Settings, Trash2, Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Undo2, Redo2, ChevronRight, Sparkles, Save, Type, Search, Eye, EyeOff, Database } from 'lucide-react';
+import { Settings, Trash2, Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Undo2, Redo2, ChevronRight, Sparkles, Save, Type, Search, Eye, EyeOff, Database, MousePointer2 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Annotation } from '../types';
 import { FONTS, COLORS } from '../constants';
@@ -35,6 +35,10 @@ interface PropertiesPanelProps {
   smartFormatAI: () => void;
   verifyAccuracy: () => void;
   isVerifying: boolean;
+  confirmAll: () => void;
+  clearAnnotations: () => void;
+  detectTextStandard: () => void;
+  detectTextVision: () => void;
   currentPage: number;
   downloadPdf: () => void;
   printCssPdf: () => void;
@@ -93,6 +97,10 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
   smartFormatAI,
   verifyAccuracy,
   isVerifying,
+  confirmAll,
+  clearAnnotations,
+  detectTextStandard,
+  detectTextVision,
   currentPage,
   downloadPdf,
   printCssPdf,
@@ -269,6 +277,20 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
           <h3 className="text-[10px] font-bold text-[#999] uppercase tracking-[0.2em]">テキストスタイル</h3>
           
           <div className="space-y-4">
+            {selectedId && (selected?.type === 'text' || selected?.type === 'ai-edit') && (
+              <div className="space-y-1.5">
+                <label className="text-[10px] text-[#666] font-bold uppercase tracking-wider">テキスト内容</label>
+                <textarea 
+                  className="w-full text-xs border border-[#D1D1D1] rounded-md px-3 py-2 outline-none bg-white focus:border-[#E5322E] focus:ring-1 focus:ring-red-100 transition-all shadow-sm min-h-[60px] resize-y"
+                  value={selected?.content || ''}
+                  onChange={(e) => {
+                    const content = e.target.value;
+                    setAnnotations(annotations.map(a => a.id === selectedId ? { ...a, content } : a));
+                  }}
+                />
+              </div>
+            )}
+
             <div className="space-y-1.5">
               <label className="text-[10px] text-[#666] font-bold uppercase tracking-wider">フォント</label>
               <select 
@@ -378,7 +400,39 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
 
         {/* Color Selection */}
         <div className="space-y-4">
-          <h3 className="text-[10px] font-bold text-[#999] uppercase tracking-[0.2em]">カラー</h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-[10px] font-bold text-[#999] uppercase tracking-[0.2em]">カラー</h3>
+            {selectedId && selected?.type === 'ai-edit' && (
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5">
+                  <input 
+                    type="checkbox" 
+                    id="mask-bg"
+                    checked={selected?.maskBackground ?? false}
+                    onChange={(e) => {
+                      const maskBackground = e.target.checked;
+                      setAnnotations(annotations.map(a => a.id === selectedId ? { ...a, maskBackground } : a));
+                    }}
+                    className="w-3 h-3 accent-[#E5322E] cursor-pointer"
+                  />
+                  <label htmlFor="mask-bg" className="text-[9px] text-[#666] font-bold cursor-pointer">背景を隠す</label>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <input 
+                    type="checkbox" 
+                    id="is-confirmed"
+                    checked={selected?.isConfirmed ?? false}
+                    onChange={(e) => {
+                      const isConfirmed = e.target.checked;
+                      setAnnotations(annotations.map(a => a.id === selectedId ? { ...a, isConfirmed } : a));
+                    }}
+                    className="w-3 h-3 accent-[#E5322E] cursor-pointer"
+                  />
+                  <label htmlFor="is-confirmed" className="text-[9px] text-[#666] font-bold cursor-pointer">確定済み</label>
+                </div>
+              </div>
+            )}
+          </div>
           <div className="grid grid-cols-6 gap-2.5 p-3 bg-white border border-[#D1D1D1] rounded-lg shadow-sm">
             {COLORS.map((color, i) => (
               <button 
@@ -438,17 +492,22 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-[#1A1A1A]">
                 <Sparkles size={16} className="text-[#E5322E]" />
-                <span className="text-[10px] font-bold uppercase tracking-[0.15em]">Document AI Mapping</span>
+                <span className="text-[10px] font-bold uppercase tracking-[0.15em]">
+                  {useGeminiOnly ? "Gemini AI Mapping" : "Document AI Mapping"}
+                </span>
               </div>
               <div className={cn(
                 "text-[8px] font-mono font-bold px-1.5 py-0.5 rounded border",
-                isDetecting ? "bg-amber-50 text-amber-600 border-amber-200 animate-pulse" : "bg-green-50 text-green-600 border-green-200"
+                isDetecting ? "bg-amber-50 text-amber-600 border-amber-200 animate-pulse" : 
+                (docAIError ? "bg-red-50 text-red-600 border-red-200" : "bg-green-50 text-green-600 border-green-200")
               )}>
-                {isDetecting ? "BUSY" : "READY"}
+                {isDetecting ? "BUSY" : (docAIError ? "FALLBACK" : "READY")}
               </div>
             </div>
             <p className="text-[10px] text-[#666] leading-relaxed relative z-10">
-              ページ全体を解析し、すべてのテキストを編集可能なブロックに自動変換します。
+              {useGeminiOnly 
+                ? "Gemini 3.1 Pro を使用して、ページ全体のテキストを解析し編集可能なブロックに変換します。" 
+                : "Google Cloud Document AI を使用して、高度なレイアウト解析とテキスト抽出を行います。"}
             </p>
             {isDetecting && (
               <div className="space-y-1.5 relative z-10">
@@ -625,6 +684,30 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
 
           <div className="grid grid-cols-2 gap-2.5">
             <button 
+              onClick={confirmAll}
+              disabled={isDetecting || annotations.filter(a => a.page === currentPage && a.type === 'ai-edit').length === 0}
+              className="col-span-2 bg-[#1A1A1A] text-white text-[10px] font-bold py-3.5 rounded-xl hover:bg-black transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-md"
+            >
+              <Save size={13} />
+              すべての AI 編集を確定
+            </button>
+            <button 
+              onClick={detectTextStandard}
+              disabled={isDetecting}
+              className="col-span-2 bg-white border border-[#D1D1D1] text-[#333] text-[10px] font-bold py-3.5 rounded-xl hover:bg-gray-50 transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-sm"
+            >
+              <MousePointer2 size={13} />
+              原本からテキストを抽出 (非AI)
+            </button>
+            <button 
+              onClick={detectTextVision}
+              disabled={isDetecting}
+              className="col-span-2 bg-white border border-[#D1D1D1] text-[#333] text-[10px] font-bold py-3.5 rounded-xl hover:bg-gray-50 transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-sm"
+            >
+              <Eye size={13} />
+              Vision API でテキスト抽出
+            </button>
+            <button 
               onClick={() => detectTextAI()}
               disabled={isDetecting}
               className="bg-[#E5322E] text-white text-[10px] font-bold py-3.5 rounded-xl hover:bg-[#C42B28] transition-all disabled:opacity-50 flex items-center justify-center gap-2 shadow-md shadow-red-100"
@@ -680,6 +763,14 @@ export const PropertiesPanel: React.FC<PropertiesPanelProps> = ({
                 </motion.div>
               ) : <Search size={13} />}
               AI 精度検証 (ハルシネーション検出)
+            </button>
+
+            <button 
+              onClick={clearAnnotations}
+              className="col-span-2 bg-white border border-red-200 text-red-600 text-[10px] font-bold py-3.5 rounded-xl hover:bg-red-50 transition-all flex items-center justify-center gap-2 shadow-sm"
+            >
+              <Trash2 size={13} />
+              現在のアノテーションをクリア
             </button>
           </div>
         </div>

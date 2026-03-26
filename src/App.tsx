@@ -304,6 +304,175 @@ body {
     }
   };
 
+  const clearAnnotations = () => {
+    if (window.confirm('現在のページのすべてのアノテーションを削除しますか？')) {
+      setAnnotations(prev => prev.filter(a => a.page !== currentPage));
+    }
+  };
+
+  const detectTextStandard = async () => {
+    if (!pdfDoc) return;
+    setIsDetecting(true);
+    setScanPhase('doc-ai');
+    setScanProgress(0);
+
+    try {
+      const page = await pdfDoc.getPage(currentPage);
+      const textContent = await page.getTextContent();
+      
+      // Get the current canvas size to match scaling
+      const canvas = canvasRef.current;
+      if (!canvas) throw new Error("Canvas not found");
+      
+      const viewport = page.getViewport({ scale: 1 });
+      const scaleX = canvas.width / viewport.width;
+      const scaleY = canvas.height / viewport.height;
+      
+      const newAnnotations: Annotation[] = textContent.items.map((item: any) => {
+        const [sX, , , sY, x, y] = item.transform;
+        
+        // Convert PDF coordinates to canvas coordinates
+        // PDF (0,0) is bottom-left, Canvas (0,0) is top-left
+        const canvasX = x * scaleX;
+        const canvasY = canvas.height - (y * scaleY) - (item.height * scaleY || Math.abs(sY) * scaleY);
+
+        return {
+          id: Math.random().toString(36).substr(2, 9),
+          type: 'ai-edit',
+          page: currentPage,
+          x: canvasX,
+          y: canvasY,
+          width: item.width * scaleX,
+          height: (item.height || Math.abs(sY)) * scaleY,
+          content: item.str,
+          color: '#000000',
+          fontSize: Math.abs(sY) * scaleY,
+          fontFamily: 'Noto Sans JP',
+          maskBackground: true,
+          isConfirmed: false
+        };
+      }).filter(ann => ann.content.trim().length > 0);
+
+      // Ask if user wants to replace or append
+      if (annotations.filter(a => a.page === currentPage).length > 0) {
+        if (window.confirm('既存のアノテーションを置き換えますか？ (キャンセルで追加)')) {
+          setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
+        } else {
+          setAnnotations(prev => [...prev, ...newAnnotations]);
+        }
+      } else {
+        setAnnotations(prev => [...prev, ...newAnnotations]);
+      }
+      
+      setScanProgress(100);
+      setTimeout(() => setIsDetecting(false), 500);
+    } catch (err) {
+      console.error("Standard extraction failed:", err);
+      setIsDetecting(false);
+    }
+  };
+
+  const detectTextVision = async () => {
+    if (!canvasRef.current || !pdfDoc) return;
+    
+    setIsDetecting(true);
+    setScanProgress(0);
+    setScanPhase('doc-ai'); // Reuse scan phase for UI
+    setDocAIError(null);
+
+    const progressInterval = setInterval(() => {
+      setScanProgress(prev => {
+        if (prev >= 98) return prev;
+        const increment = prev < 50 ? (Math.random() * 6 + 4) : (Math.random() * 3 + 1);
+        return Math.min(98, prev + increment);
+      });
+    }, 1000);
+
+    try {
+      const originalCanvas = canvasRef.current;
+      const maxDim = 3072; 
+      let width = originalCanvas.width;
+      let height = originalCanvas.height;
+      
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = (maxDim / width) * height;
+          width = maxDim;
+        } else {
+          width = (maxDim / height) * width;
+          height = maxDim;
+        }
+      }
+      
+      const offscreenCanvas = document.createElement('canvas');
+      offscreenCanvas.width = width;
+      offscreenCanvas.height = height;
+      const ctx = offscreenCanvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = 'white';
+        ctx.fillRect(0, 0, width, height);
+        ctx.drawImage(originalCanvas, 0, 0, width, height);
+      }
+      
+      const imageData = offscreenCanvas.toDataURL('image/png').split(',')[1];
+      
+      const response = await fetch('/api/detect-vision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: imageData, projectId })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Vision API failed");
+      }
+
+      const data = await response.json();
+      const visionBlocks = data.blocks || [];
+
+      // Convert Vision API blocks to annotations
+      const canvas = canvasRef.current;
+      const newAnnotations: Annotation[] = visionBlocks.map((b: any) => {
+        const [ymin, xmin, ymax, xmax] = b.box;
+        
+        return {
+          id: Math.random().toString(36).substr(2, 9),
+          type: 'ai-edit',
+          page: currentPage,
+          x: (xmin / 1000) * canvas.width,
+          y: (ymin / 1000) * canvas.height,
+          width: ((xmax - xmin) / 1000) * canvas.width,
+          height: ((ymax - ymin) / 1000) * canvas.height,
+          content: b.text,
+          color: '#000000',
+          fontSize: 12, // Default
+          fontFamily: 'Noto Sans JP',
+          maskBackground: true,
+          isConfirmed: false
+        };
+      });
+
+      if (annotations.filter(a => a.page === currentPage).length > 0) {
+        if (window.confirm('既存のアノテーションを置き換えますか？ (キャンセルで追加)')) {
+          setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
+        } else {
+          setAnnotations(prev => [...prev, ...newAnnotations]);
+        }
+      } else {
+        setAnnotations(prev => [...prev, ...newAnnotations]);
+      }
+
+      clearInterval(progressInterval);
+      setScanProgress(100);
+      setTimeout(() => setIsDetecting(false), 500);
+    } catch (err: any) {
+      console.error("Vision API detection failed:", err);
+      clearInterval(progressInterval);
+      setIsDetecting(false);
+      setDocAIError(`Vision API エラー: ${err.message}`);
+    }
+  };
+
   const detectTextAI = async (targetIds?: string[]) => {
     if (!canvasRef.current || !pdfDoc) return;
     
@@ -358,46 +527,53 @@ body {
       let docAIBlocks = [];
       
       // Only run Document AI for full page detection
-      if (!isPartial && !useGeminiOnly && projectId && processorId) {
-        setScanPhase('doc-ai');
-        setScanProgress(5);
-        
-        try {
-          const docAIResponse = await fetchWithRetry('/api/detect', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-              image: imageData,
-              processorId: processorId,
-              projectId: projectId,
-              location: location
-            })
-          });
+      if (!isPartial && !useGeminiOnly) {
+        if (projectId && processorId) {
+          setScanPhase('doc-ai');
+          setScanProgress(5);
+          
+          try {
+            const docAIResponse = await fetchWithRetry('/api/detect', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                image: imageData,
+                processorId: processorId,
+                projectId: projectId,
+                location: location
+              })
+            });
 
-          if (!docAIResponse.ok) {
-            const errorData = await docAIResponse.json().catch(() => ({}));
-            console.warn("Document AI failed, falling back to Gemini-only analysis.", errorData);
-            
-            const errorMessage = errorData.details || errorData.error || '不明なエラー';
-            
-            if (docAIResponse.status === 403 || docAIResponse.status === 401 || errorMessage.includes('PERMISSION_DENIED')) {
-              const deniedProject = errorMessage.match(/projects\/([^\/]+)/)?.[1];
-              if (deniedProject && deniedProject !== projectId) {
-                setDocAIError(`GCP プロジェクト不一致: 現在の設定は '${projectId}' ですが、アクセス先は '${deniedProject}' です。正しいプロジェクトIDを入力してください。`);
+            if (!docAIResponse.ok) {
+              const errorData = await docAIResponse.json().catch(() => ({}));
+              console.warn("Document AI failed, falling back to Gemini-only analysis.", errorData);
+              
+              const errorMessage = errorData.details || errorData.error || '不明なエラー';
+              
+              if (docAIResponse.status === 403 || docAIResponse.status === 401 || errorMessage.includes('PERMISSION_DENIED')) {
+                const deniedProject = errorMessage.match(/projects\/([^\/]+)/)?.[1];
+                if (deniedProject && deniedProject !== projectId) {
+                  setDocAIError(`GCP プロジェクト不一致: 現在の設定は '${projectId}' ですが、アクセス先は '${deniedProject}' です。正しいプロジェクトIDを入力してください。`);
+                } else {
+                  setDocAIError(`GCP 権限エラー: ${errorMessage}\n※ サービスアカウントに 'Document AI API User' ロールが付与されているか確認してください。`);
+                }
+              } else if (docAIResponse.status === 500) {
+                setDocAIError(`サーバーエラー (500): ${errorMessage}\n※ GCP サービスアカウントの認証情報 (GOOGLE_APPLICATION_CREDENTIALS) が正しく設定されているか確認してください。`);
               } else {
-                setDocAIError(`GCP 権限エラー: ${errorMessage}\n※ サービスアカウントに 'Document AI API User' ロールが付与されているか確認してください。`);
+                setDocAIError(`Document AI エラー (${docAIResponse.status}): ${errorMessage}`);
               }
-            } else if (docAIResponse.status === 500) {
-              setDocAIError(`サーバーエラー (500): ${errorMessage}\n※ GCP サービスアカウントの認証情報 (GOOGLE_APPLICATION_CREDENTIALS) が正しく設定されているか確認してください。`);
             } else {
-              setDocAIError(`Document AI エラー (${docAIResponse.status}): ${errorMessage}`);
+              const data = await docAIResponse.json();
+              docAIBlocks = data.blocks || [];
             }
-          } else {
-            const data = await docAIResponse.json();
-            docAIBlocks = data.blocks || [];
+          } catch (err) {
+            console.warn("Document AI request failed, falling back to Gemini-only analysis.", err);
+            setDocAIError("ネットワークエラー: Document AI への接続に失敗しました。");
           }
-        } catch (err) {
-          console.warn("Document AI request failed, falling back to Gemini-only analysis.", err);
+        } else {
+          // Missing config
+          console.log("Document AI configuration missing, using Gemini-only analysis.");
+          setDocAIError("GCP 設定未完了: プロジェクトIDまたはプロセッサーIDが設定されていないため、Gemini のみで解析します。");
         }
       }
 
@@ -524,6 +700,7 @@ body {
             textAlign: block.textAlign || 'left',
             fontWeight: block.fontWeight || 'normal',
             fontStyle: block.fontStyle || 'normal',
+            maskBackground: true,
           };
         });
         setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
@@ -765,7 +942,8 @@ body {
       color: '#000000',
       fontSize: block.fontSize || 12,
       fontFamily: block.fontFamily || 'Arial Unicode MS',
-      textAlign: 'left'
+      textAlign: 'left',
+      maskBackground: true
     };
     setAnnotations([...annotations, newAnnotation]);
     setSelectedIds([newAnnotation.id]);
@@ -972,6 +1150,7 @@ body {
                     font-weight: ${ann.fontWeight || 'normal'};
                     font-style: ${ann.fontStyle || 'normal'};
                     opacity: ${ann.opacity ?? 1};
+                    background-color: ${ann.maskBackground ? 'white' : 'transparent'};
                     ${ann.css || ''}
                   `;
                   
@@ -1076,6 +1255,14 @@ body {
     setIsExportDropdownOpen(false);
   };
 
+  const confirmAll = () => {
+    setAnnotations(prev => prev.map(ann => 
+      ann.page === currentPage && ann.type === 'ai-edit' 
+        ? { ...ann, isConfirmed: true } 
+        : ann
+    ));
+  };
+
   const verifyAccuracy = async () => {
     if (!pdfFile || isVerifying) return;
     setIsVerifying(true);
@@ -1108,7 +1295,7 @@ body {
         const color = ann.color ? hexToRgb(ann.color) : rgb(0, 0, 0);
         
         // If it's an AI edit, draw a white background to mask original text
-        if (ann.type === 'ai-edit' && ann.width && ann.height) {
+        if (ann.type === 'ai-edit' && ann.maskBackground && ann.width && ann.height) {
           page.drawRectangle({
             x: ann.x,
             y: height - ann.y - ann.height,
@@ -1353,9 +1540,13 @@ body {
                 activeTool={activeTool}
                 setActiveTool={setActiveTool}
                 detectTextAI={detectTextAI}
+                detectTextStandard={detectTextStandard}
+                detectTextVision={detectTextVision}
                 isDetecting={isDetecting}
                 currentColor={currentColor}
                 currentFontSize={currentFontSize}
+                showBackground={showBackground}
+                setShowBackground={setShowBackground}
               />
 
               {/* PDF Canvas */}
@@ -1412,7 +1603,14 @@ body {
                     "relative shadow-[0_20px_50px_rgba(0,0,0,0.2)] bg-white transition-all duration-300",
                     activeTool === 'edit' && "ring-4 ring-[#E5322E]/10 ring-offset-0 border-2 border-dotted border-[#E5322E]/30"
                   )}>
-                    <canvas ref={canvasRef} onClick={handleCanvasClick} className="block" />
+                    <canvas 
+                      ref={canvasRef} 
+                      onClick={handleCanvasClick} 
+                      className={cn(
+                        "block transition-opacity duration-300",
+                        !showBackground && "opacity-0"
+                      )} 
+                    />
                     
                     {/* AI Mapping Loading Overlay */}
                     {isDetecting && (
@@ -1464,15 +1662,17 @@ body {
                             <div className="flex justify-center gap-4">
                               <div className="flex items-center gap-1.5">
                                 <div className={cn("w-1.5 h-1.5 rounded-full", scanPhase === 'doc-ai' || scanPhase === 'gemini-correction' || scanPhase === 'polishing' ? "bg-[#E5322E]" : "bg-[#D1D1D1]")} />
-                                <span className="text-[9px] text-[#999]">Document AI 検出</span>
+                                <span className="text-[9px] text-[#999]">
+                                  {useGeminiOnly ? "Gemini OCR 解析" : (docAIError ? "Gemini 代替解析" : "Document AI 検出")}
+                                </span>
                               </div>
                               <div className="flex items-center gap-1.5">
                                 <div className={cn("w-1.5 h-1.5 rounded-full", scanPhase === 'gemini-correction' || scanPhase === 'polishing' ? "bg-[#E5322E]" : "bg-[#D1D1D1]")} />
-                                <span className="text-[9px] text-[#999]">Gemini 調整・補正</span>
+                                <span className="text-[9px] text-[#999]">Gemini 構造化・補正</span>
                               </div>
                               <div className="flex items-center gap-1.5">
                                 <div className={cn("w-1.5 h-1.5 rounded-full", scanPhase === 'polishing' ? "bg-[#E5322E]" : "bg-[#D1D1D1]")} />
-                                <span className="text-[9px] text-[#999]">最終調整</span>
+                                <span className="text-[9px] text-[#999]">最終ポリッシュ</span>
                               </div>
                             </div>
                           </div>
@@ -1568,7 +1768,11 @@ body {
                             key={ann.id}
                             className={cn(
                               "absolute pointer-events-auto transition-all duration-200",
-                              ann.type === 'ai-edit' && "border-2 border-dotted border-[#E5322E]/60 bg-[#E5322E]/5 hover:border-[#E5322E] hover:bg-[#E5322E]/10 shadow-[0_0_8px_rgba(229,50,46,0.1)]",
+                              ann.type === 'ai-edit' && (
+                                ann.isConfirmed 
+                                  ? "border-2 border-solid border-[#E5322E] bg-white shadow-md" 
+                                  : "border-2 border-dotted border-[#E5322E]/60 bg-[#E5322E]/5 hover:border-[#E5322E] hover:bg-[#E5322E]/10 shadow-[0_0_8px_rgba(229,50,46,0.1)]"
+                              ),
                               selectedIds.includes(ann.id) && "ring-2 ring-[#E5322E] ring-offset-2 z-30 shadow-lg",
                               analysisQueue.includes(ann.id) && "ring-2 ring-blue-400 ring-offset-2 animate-pulse",
                               activeTool === 'select' ? "cursor-move" : "cursor-default",
@@ -1600,8 +1804,11 @@ body {
                               </div>
                             )}
                             {ann.type === 'ai-edit' && !comparingVersion && (
-                              <div className="absolute -top-3.5 -right-1 bg-[#E5322E] text-white text-[7px] font-bold px-1.5 py-0.5 rounded-full z-10 pointer-events-none shadow-sm">
-                                AI
+                              <div className={cn(
+                                "absolute -top-3.5 -right-1 text-white text-[7px] font-bold px-1.5 py-0.5 rounded-full z-10 pointer-events-none shadow-sm flex items-center gap-0.5",
+                                ann.isConfirmed ? "bg-green-600" : "bg-[#E5322E]"
+                              )}>
+                                {ann.isConfirmed ? "✓" : "AI"}
                               </div>
                             )}
                             {ann.type === 'text' && (
@@ -1627,10 +1834,23 @@ body {
                               />
                             )}
                             {ann.type === 'ai-edit' && (
+                              <div className={cn(
+                                "absolute -top-4 left-0 text-white text-[8px] font-bold px-1 rounded-sm flex items-center gap-0.5 shadow-sm z-10 pointer-events-none transition-colors",
+                                ann.isConfirmed ? "bg-green-600" : "bg-[#E5322E]"
+                              )}>
+                                {ann.isConfirmed ? <Save size={8} /> : <Sparkles size={8} />}
+                                <span>{ann.isConfirmed ? "確定済み" : "AI"}</span>
+                              </div>
+                            )}
+                            {ann.type === 'ai-edit' && (
                               <textarea 
                                 value={ann.content} 
                                 onChange={(e) => setAnnotations(annotations.map(a => a.id === ann.id ? { ...a, content: e.target.value } : a))}
-                                className="bg-transparent border-none outline-none w-full resize-none overflow-hidden"
+                                className={cn(
+                                  "border-none outline-none w-full resize-none overflow-hidden transition-colors",
+                                  ann.maskBackground ? "bg-white" : "bg-transparent",
+                                  ann.isConfirmed ? "hover:ring-1 hover:ring-green-600/30" : "hover:ring-1 hover:ring-[#E5322E]/30"
+                                )}
                                 style={{ 
                                   fontSize: 'inherit', 
                                   color: 'inherit',
@@ -1803,6 +2023,10 @@ body {
           smartFormatAI={smartFormatAI}
           verifyAccuracy={verifyAccuracy}
           isVerifying={isVerifying}
+          confirmAll={confirmAll}
+          clearAnnotations={clearAnnotations}
+          detectTextStandard={detectTextStandard}
+          detectTextVision={detectTextVision}
           currentPage={currentPage}
           downloadPdf={downloadPdf}
           printCssPdf={printCssPdf}

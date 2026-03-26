@@ -21,6 +21,8 @@ export interface Annotation {
   points?: { x: number; y: number }[];
   css?: string;
   className?: string;
+  maskBackground?: boolean;
+  isConfirmed?: boolean;
 }
 
 export interface TextBlock {

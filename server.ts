@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { DocumentProcessorServiceClient } from "@google-cloud/documentai";
+import { ImageAnnotatorClient } from "@google-cloud/vision";
 import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
@@ -15,6 +16,8 @@ async function startServer() {
 
   // Document AI Client
   let docAIClient: DocumentProcessorServiceClient;
+  let visionClient: ImageAnnotatorClient;
+  
   try {
     const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS 
       ? JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS) 
@@ -24,11 +27,18 @@ async function startServer() {
       credentials,
       projectId: process.env.GOOGLE_CLOUD_PROJECT_ID
     });
-    console.log("Document AI Client Initialized successfully.");
+
+    visionClient = new ImageAnnotatorClient({
+      credentials,
+      projectId: process.env.GOOGLE_CLOUD_PROJECT_ID
+    });
+
+    console.log("GCP Clients Initialized successfully.");
   } catch (err) {
-    console.error("Failed to initialize Document AI Client:", err);
+    console.error("Failed to initialize GCP Clients:", err);
     // Fallback to default initialization if JSON parsing fails
     docAIClient = new DocumentProcessorServiceClient();
+    visionClient = new ImageAnnotatorClient();
   }
 
   // API: Document AI Detection
@@ -149,6 +159,73 @@ async function startServer() {
         error: "Document AI 処理中にエラーが発生しました。",
         details: error.message,
         code: error.code
+      });
+    }
+  });
+
+  // API: Vision API Detection
+  app.post("/api/detect-vision", async (req, res) => {
+    try {
+      const { image, projectId } = req.body;
+      
+      const effectiveProjectId = projectId || process.env.GOOGLE_CLOUD_PROJECT_ID;
+
+      const clientOptions: any = {};
+      const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS 
+        ? JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS) 
+        : undefined;
+      
+      if (credentials) clientOptions.credentials = credentials;
+      if (effectiveProjectId) clientOptions.projectId = effectiveProjectId;
+
+      const client = new ImageAnnotatorClient(clientOptions);
+      
+      const [result] = await client.documentTextDetection({
+        image: { content: image }
+      });
+
+      const fullTextAnnotation = result.fullTextAnnotation;
+      let blocks: any[] = [];
+
+      if (fullTextAnnotation && fullTextAnnotation.pages) {
+        for (const page of fullTextAnnotation.pages) {
+          if (page.blocks) {
+            for (const block of page.blocks) {
+              if (block.paragraphs) {
+                for (const paragraph of block.paragraphs) {
+                  const vertices = paragraph.boundingBox?.normalizedVertices || paragraph.boundingBox?.vertices || [];
+                  
+                  // Vision API returns normalized vertices (0-1) or absolute vertices
+                  // We need to handle both and convert to our 0-1000 scale
+                  const isNormalized = vertices.length > 0 && vertices[0].x <= 1 && vertices[0].y <= 1;
+                  const scale = isNormalized ? 1000 : 1; // If absolute, we'd need image dimensions, but let's assume normalized for now or handle it
+
+                  const ymin = Math.min(...vertices.map((v: any) => v.y || 0)) * (isNormalized ? 1000 : 1);
+                  const xmin = Math.min(...vertices.map((v: any) => v.x || 0)) * (isNormalized ? 1000 : 1);
+                  const ymax = Math.max(...vertices.map((v: any) => v.y || 0)) * (isNormalized ? 1000 : 1);
+                  const xmax = Math.max(...vertices.map((v: any) => v.x || 0)) * (isNormalized ? 1000 : 1);
+
+                  let text = "";
+                  if (paragraph.words) {
+                    text = paragraph.words.map((w: any) => 
+                      w.symbols?.map((s: any) => s.text).join("")
+                    ).join(" ");
+                  }
+
+                  blocks.push({ text: text.trim(), box: [ymin, xmin, ymax, xmax] });
+                }
+              }
+            }
+          }
+        }
+      }
+
+      res.json({ blocks: blocks.filter(b => b.text && b.text.length > 0) });
+    } catch (error: any) {
+      console.error("Vision API Error:", error);
+      res.status(500).json({ 
+        error: "Vision API 処理中にエラーが発生しました。",
+        details: error.message
       });
     }
   });
