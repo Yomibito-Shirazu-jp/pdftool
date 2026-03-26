@@ -577,7 +577,29 @@ body {
         }
       }
 
-      // --- PHASE 2: Gemini Adjustment & Correction ---
+      // --- PHASE 1.5: Retry via Vision API if Document AI returned nothing ---
+      if (docAIBlocks.length === 0 && !isPartial) {
+        setScanPhase('doc-ai');
+        setScanProgress(20);
+        console.log('Document AI returned no blocks, trying Vision API as fallback...');
+        try {
+          const visionResponse = await fetchWithRetry('/api/detect-vision', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: imageData, projectId })
+          });
+          if (visionResponse.ok) {
+            const visionData = await visionResponse.json();
+            docAIBlocks = visionData.blocks || [];
+            console.log(`Vision API fallback returned ${docAIBlocks.length} blocks.`);
+          }
+        } catch (err) {
+          console.warn('Vision API fallback also failed:', err);
+        }
+      }
+
+      // --- PHASE 2: Gemini Text Correction & Style Extraction ---
+      // Document AI/Vision coordinates are KEPT as-is. Gemini only corrects text & extracts styles.
       setScanPhase('gemini-correction');
       setScanProgress(30);
       
@@ -585,36 +607,33 @@ body {
       if (!apiKey) throw new Error("Gemini API Key is missing");
       const ai = new GoogleGenAI({ apiKey });
 
-      const geminiWithRetry = async (retries = 2): Promise<any> => {
+      const canvasWidth = canvasRef.current.width / scale;
+      const canvasHeight = canvasRef.current.height / scale;
+
+      const geminiFormatBlocks = async (blocks: any[], retries = 2): Promise<any[]> => {
         try {
           const targetAnnotations = isPartial 
             ? annotations.filter(a => idsToProcess.includes(a.id))
             : [];
 
           const promptText = isPartial 
-            ? `I have selected specific text blocks to fix. 
-               Current blocks: ${JSON.stringify(targetAnnotations.map(a => ({ id: a.id, text: a.content, box: [a.y, a.x, a.y + (a.height || 0), a.x + (a.width || 0)] })))}.
-               
-               Your task is to:
-               1) Look at the provided image at these locations.
-               2) Correct the text content for these specific blocks.
-               3) Refine their bounding boxes and styling.
-               4) Return the corrected blocks with their original IDs.
-               
-               Return ONLY a JSON array of objects with the schema: { id: string, text: string, box: [number, number, number, number], fontSize: number, fontFamily: string, textAlign: string, color: string, fontWeight: string, fontStyle: string }.`
-            : `I have performed OCR detection. Here are the raw blocks: ${JSON.stringify(docAIBlocks)}. 
-               
-               Your task is to:
-               1) Use the provided image as the ground truth.
-               2) Refine the bounding boxes for absolute precision (ymin, xmin, ymax, xmax in 0-1000 normalized coordinates).
-               3) Correct any OCR errors, missing characters, or punctuation.
-               4) Extract styling: fontSize (pt), fontFamily (best match), textAlign (left/center/right), color (hex), fontWeight (bold/normal), fontStyle (italic/normal).
-               5) Group related text into logical blocks if they belong to the same paragraph.
-               
-               Return ONLY a JSON array of objects with the schema: { text: string, box: [number, number, number, number], fontSize: number, fontFamily: string, textAlign: string, color: string, fontWeight: string, fontStyle: string }.`;
+            ? `以下のテキストブロックの内容を画像と照合して修正してください。座標は変更不要です。
 
-          const correctionResponse = await ai.models.generateContent({
-            model: "gemini-3.1-pro-preview",
+${targetAnnotations.map((a, i) => `[${i}] id="${a.id}" text="${a.content}"`).join('\n')}
+
+各ブロックに対して、以下のJSONスキーマで返してください:
+{ id: string, text: string, fontSize: number, fontFamily: string, textAlign: "left"|"center"|"right", color: string(hex), fontWeight: "bold"|"normal", fontStyle: "italic"|"normal" }`
+            : `以下はOCRで検出された${blocks.length}個のテキストブロックです。画像を参照して各ブロックのテキストを正確に修正し、スタイル情報を推定してください。
+
+※ 座標(box)の変更は一切不要です。index番号で元ブロックと1:1対応させてください。
+
+${blocks.map((b: any, i: number) => `[${i}] "${b.text}"`).join('\n')}
+
+各ブロックに対して以下のJSONスキーマで返してください:
+{ index: number, text: string, fontSize: number, fontFamily: string, textAlign: "left"|"center"|"right", color: string(hex), fontWeight: "bold"|"normal", fontStyle: "italic"|"normal" }`;
+
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-pro",
             contents: [
               {
                 parts: [
@@ -624,67 +643,63 @@ body {
               }
             ],
             config: {
-              systemInstruction: "You are a high-precision Document Reconstruction Engine. Your output must be visually identical to the original document when rendered. Return valid JSON only.",
+              systemInstruction: "あなたは高精度なドキュメント復元エンジンです。OCRのテキスト誤りを修正し、スタイル情報を推定してください。座標は一切変更しないでください。有効なJSONのみ返してください。",
               responseMimeType: "application/json"
             }
           });
 
-          const text = correctionResponse.text;
+          const text = response.text;
           if (!text) throw new Error("Gemini returned an empty response");
           
-          try {
-            const parsed = JSON.parse(text);
-            if (!Array.isArray(parsed)) throw new Error("Gemini response is not an array");
-            return parsed;
-          } catch (e) {
-            console.error("Failed to parse Gemini JSON:", text);
-            throw new Error("Invalid JSON format from Gemini");
-          }
+          const parsed = JSON.parse(text);
+          if (!Array.isArray(parsed)) throw new Error("Gemini response is not an array");
+          return parsed;
         } catch (err) {
           if (retries > 0) {
             console.warn(`Gemini error, retrying... (${retries} left)`, err);
             await new Promise(resolve => setTimeout(resolve, 2000));
-            return geminiWithRetry(retries - 1);
+            return geminiFormatBlocks(blocks, retries - 1);
           }
           throw err;
         }
       };
 
-      const finalResult = await geminiWithRetry();
-      
-      const canvasWidth = canvasRef.current.width / scale;
-      const canvasHeight = canvasRef.current.height / scale;
+      // If we have blocks, run Gemini formatting. Otherwise use blocks as-is.
+      let styledResults: any[] = [];
+      if (docAIBlocks.length > 0) {
+        try {
+          styledResults = await geminiFormatBlocks(docAIBlocks);
+        } catch (err) {
+          console.warn('Gemini formatting failed, using raw OCR blocks:', err);
+          styledResults = docAIBlocks.map((b: any, i: number) => ({ index: i, text: b.text }));
+        }
+      }
 
       if (isPartial) {
-        // Update existing annotations with scaled coordinates
+        // Update existing annotations - only text & styles, keep coordinates
         setAnnotations(prev => prev.map(ann => {
-          const update = finalResult.find((r: any) => r.id === ann.id);
+          const update = styledResults.find((r: any) => r.id === ann.id);
           if (update) {
-            const box = update.box;
             return {
               ...ann,
-              content: update.text,
-              x: (box[1] / 1000) * canvasWidth,
-              y: (box[0] / 1000) * canvasHeight,
-              width: ((box[3] - box[1]) / 1000) * canvasWidth,
-              height: ((box[2] - box[0]) / 1000) * canvasHeight,
-              fontSize: update.fontSize,
-              fontFamily: update.fontFamily,
-              textAlign: update.textAlign,
-              color: update.color,
-              fontWeight: update.fontWeight,
-              fontStyle: update.fontStyle
+              content: update.text || ann.content,
+              fontSize: update.fontSize || ann.fontSize,
+              fontFamily: update.fontFamily || ann.fontFamily,
+              textAlign: update.textAlign || ann.textAlign,
+              color: update.color || ann.color,
+              fontWeight: update.fontWeight || ann.fontWeight,
+              fontStyle: update.fontStyle || ann.fontStyle,
             };
           }
           return ann;
         }));
-        // Remove from queue and clear selection
         setAnalysisQueue(prev => prev.filter(id => !idsToProcess.includes(id)));
         setSelectedIds([]);
       } else {
-        // Full page replacement
-        const newAnnotations: Annotation[] = finalResult.map((block: any, index: number) => {
+        // Full page: merge Document AI coordinates with Gemini styles
+        const newAnnotations: Annotation[] = docAIBlocks.map((block: any, index: number) => {
           const box = block.box;
+          const style = styledResults.find((s: any) => s.index === index) || {};
           return {
             id: `ai-${Date.now()}-${index}`,
             type: 'ai-edit',
@@ -693,13 +708,13 @@ body {
             y: (box[0] / 1000) * canvasHeight,
             width: ((box[3] - box[1]) / 1000) * canvasWidth,
             height: ((box[2] - box[0]) / 1000) * canvasHeight,
-            content: block.text,
-            fontSize: block.fontSize || 12,
-            fontFamily: block.fontFamily || 'Noto Sans JP',
-            color: block.color || '#000000',
-            textAlign: block.textAlign || 'left',
-            fontWeight: block.fontWeight || 'normal',
-            fontStyle: block.fontStyle || 'normal',
+            content: style.text || block.text,
+            fontSize: style.fontSize || 12,
+            fontFamily: style.fontFamily || 'Noto Sans JP',
+            color: style.color || '#000000',
+            textAlign: style.textAlign || 'left',
+            fontWeight: style.fontWeight || 'normal',
+            fontStyle: style.fontStyle || 'normal',
             maskBackground: true,
           };
         });
