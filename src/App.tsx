@@ -70,7 +70,7 @@ export default function App() {
   const [scanPhase, setScanPhase] = useState<'doc-ai' | 'gemini-correction' | 'polishing'>('doc-ai');
   const [docAIError, setDocAIError] = useState<string | null>(null);
   const [useGeminiOnly, setUseGeminiOnly] = useState(false);
-  const [processorId, setProcessorId] = useState(() => localStorage.getItem('docai_processor_id') || '8294184ec60f19aa');
+  const [processorId, setProcessorId] = useState(() => localStorage.getItem('docai_processor_id') || '57695b373b653f96');
   const [projectId, setProjectId] = useState(() => localStorage.getItem('docai_project_id') || 'aidriven-mastering-fyqu');
   const [location, setLocation] = useState(() => localStorage.getItem('docai_location') || 'us');
 

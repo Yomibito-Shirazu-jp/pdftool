@@ -58,7 +58,7 @@ async function startServer() {
   // API: Config - expose Document AI settings to frontend
   app.get("/api/config", (req, res) => {
     res.json({
-      processorId: process.env.DOCUMENT_AI_PROCESSOR_ID || '8294184ec60f19aa',
+      processorId: process.env.DOCUMENT_AI_PROCESSOR_ID || '57695b373b653f96',
       projectId: process.env.GOOGLE_CLOUD_PROJECT_ID || 'aidriven-mastering-fyqu',
       location: process.env.GOOGLE_CLOUD_LOCATION || 'us',
       hasGemini: !!process.env.GEMINI_API_KEY,
@@ -110,12 +110,15 @@ async function startServer() {
           content: image,
           mimeType: effectiveMimeType,
         },
-        // Process specific page if requested (Layout Parser doesn't support ocrConfig)
-        ...(pageNumber && effectiveMimeType === "application/pdf" ? {
-          processOptions: {
+        processOptions: {
+          ocrConfig: {
+            enableNativePdfParsing: effectiveMimeType === "application/pdf",
+            hints: { languageHints: ["ja", "en"] },
+          },
+          ...(pageNumber && effectiveMimeType === "application/pdf" ? {
             individualPageSelector: { pages: [pageNumber] }
-          }
-        } : {})
+          } : {})
+        }
       };
 
       const [result] = await regionalClient.processDocument(request);
