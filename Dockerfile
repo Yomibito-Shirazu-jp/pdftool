@@ -4,12 +4,14 @@ WORKDIR /app
 
 # Copy package files
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+
+# Install ALL dependencies (including devDeps for vite build)
+RUN npm ci
 
 # Copy source
 COPY . .
 
-# Build frontend
+# Build frontend (Vite)
 RUN npm run build
 
 # Set production mode
@@ -18,5 +20,5 @@ ENV PORT=8080
 
 EXPOSE 8080
 
-# Start Express server
+# Start Express server (tsx stays as dep for runtime)
 CMD ["npx", "tsx", "server.ts"]
