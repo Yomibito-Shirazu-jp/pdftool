@@ -2,6 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import { DocumentProcessorServiceClient } from "@google-cloud/documentai";
 import { ImageAnnotatorClient } from "@google-cloud/vision";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { createClient } from "@supabase/supabase-js";
 import path from "path";
 import fs from "fs";
@@ -382,6 +383,101 @@ async function startServer() {
     } catch (error: any) {
       console.error('POST /api/documents/:id/confirm error:', error);
       res.status(500).json({ error: error.message });
+    }
+  });
+  // POST /api/documents/:id/structure — Gemini text structuring pipeline
+  app.post("/api/documents/:id/structure", async (req, res) => {
+    try {
+      const supabase = getSupabase();
+      const documentId = req.params.id;
+      const { blocks, pageNumber } = req.body;
+
+      const geminiKey = process.env.GEMINI_API_KEY;
+      if (!geminiKey) {
+        return res.status(500).json({ error: "GEMINI_API_KEY が設定されていません。" });
+      }
+
+      const genAI = new GoogleGenerativeAI(geminiKey);
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro-preview-05-06" });
+
+      // Prepare OCR text for Gemini
+      const ocrText = blocks.map((b: any, i: number) => 
+        `[Block ${i + 1}] (box: ${b.box?.join(',')})\n${b.text}`
+      ).join('\n\n');
+
+      const prompt = `あなたは印刷・組版の専門家です。以下のOCR抽出テキストを整頓してください。
+
+## 指示
+1. 各ブロックを以下のタイプに分類: heading(見出し), body(本文), table(表), note(注記), header(ヘッダー), footer(フッター), page_number(ページ番号)
+2. OCRの誤字・脱字を文脈から修正
+3. 表データはMarkdownテーブルに変換
+4. 読み順（reading_order）を上から下、右から左（縦書きの場合）で付与
+5. 原文の意味は絶対に変えない
+
+## 出力形式（JSON配列）
+[
+  {
+    "original_index": 0,
+    "block_type": "heading",
+    "structured_text": "修正後のテキスト",
+    "reading_order": 1
+  }
+]
+
+## OCR抽出テキスト（${blocks.length}ブロック）
+${ocrText}`;
+
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+      
+      // Parse JSON from Gemini response
+      let structured;
+      try {
+        const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+        structured = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+      } catch (parseErr) {
+        console.error("Gemini response parse error:", parseErr);
+        console.error("Response was:", responseText);
+        return res.status(500).json({ error: "Gemini応答の解析に失敗しました。", raw: responseText });
+      }
+
+      // Update blocks in Supabase with structured data
+      const updateResults = [];
+      for (const item of structured) {
+        const originalBlock = blocks[item.original_index];
+        if (!originalBlock) continue;
+
+        // If we have existing block IDs in Supabase, update them
+        if (originalBlock.db_id) {
+          const { error } = await supabase
+            .from('extracted_blocks')
+            .update({
+              block_type: item.block_type,
+              structured_text: item.structured_text,
+              reading_order: item.reading_order,
+              gemini_text: item.structured_text
+            } as any)
+            .eq('id', originalBlock.db_id);
+          
+          if (error) console.warn(`Block update error for ${originalBlock.db_id}:`, error);
+        }
+
+        updateResults.push({
+          ...item,
+          original_text: originalBlock.text,
+          box: originalBlock.box
+        });
+      }
+
+      res.json({ 
+        structured: updateResults, 
+        count: updateResults.length,
+        page: pageNumber 
+      });
+
+    } catch (error: any) {
+      console.error("Gemini structuring error:", error);
+      res.status(500).json({ error: "テキスト整頓中にエラーが発生しました。", details: error.message });
     }
   });
 
