@@ -110,18 +110,12 @@ async function startServer() {
           content: image,
           mimeType: effectiveMimeType,
         },
-        // Layout Parser options for better Japanese OCR
-        processOptions: {
-          ocrConfig: {
-            enableNativePdfParsing: effectiveMimeType === "application/pdf",
-            language: "ja",
-            advancedOcrOptions: ["ENABLE_IMAGE_QUALITY_SCORES"],
-          },
-          // Process specific page if requested
-          ...(pageNumber && effectiveMimeType === "application/pdf" ? {
+        // Process specific page if requested (Layout Parser doesn't support ocrConfig)
+        ...(pageNumber && effectiveMimeType === "application/pdf" ? {
+          processOptions: {
             individualPageSelector: { pages: [pageNumber] }
-          } : {})
-        }
+          }
+        } : {})
       };
 
       const [result] = await regionalClient.processDocument(request);
