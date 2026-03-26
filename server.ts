@@ -9,10 +9,17 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-// Supabase client (server-side with service_role key)
+// Supabase client (lazy init - server starts even without key)
 const supabaseUrl = process.env.SUPABASE_URL || 'https://avakiygdyafqjrhlvbjg.supabase.co';
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+let _supabase: ReturnType<typeof createClient> | null = null;
+function getSupabase() {
+  if (!_supabase) {
+    if (!supabaseKey) throw new Error('SUPABASE_SERVICE_ROLE_KEY is not set');
+    _supabase = createClient(supabaseUrl, supabaseKey);
+  }
+  return _supabase;
+}
 
 async function startServer() {
   const app = express();
@@ -249,7 +256,7 @@ async function startServer() {
       }
 
       // Create document record
-      const { data: doc, error: docError } = await supabase
+      const { data: doc, error: docError } = await getSupabase()
         .from('pdf_documents')
         .insert({ firebase_uid, filename, page_count: page_count || 0, status: 'extracted' })
         .select('id')
@@ -279,7 +286,7 @@ async function startServer() {
           sort_order: i
         }));
 
-        const { error: blocksError } = await supabase
+        const { error: blocksError } = await getSupabase()
           .from('extracted_blocks')
           .insert(blockRecords);
 
@@ -299,7 +306,7 @@ async function startServer() {
       const { id } = req.params;
       const page = req.query.page ? parseInt(req.query.page as string) : undefined;
 
-      let query = supabase
+      let query = getSupabase()
         .from('extracted_blocks')
         .select('*')
         .eq('document_id', id)
@@ -334,7 +341,7 @@ async function startServer() {
         return res.status(400).json({ error: 'No valid fields to update' });
       }
 
-      const { data, error } = await supabase
+      const { data, error } = await getSupabase()
         .from('extracted_blocks')
         .update(updates)
         .eq('id', id)
@@ -355,7 +362,7 @@ async function startServer() {
       const { id } = req.params;
       const { page } = req.body;
 
-      let query = supabase
+      let query = getSupabase()
         .from('extracted_blocks')
         .update({ is_confirmed: true })
         .eq('document_id', id);
@@ -366,7 +373,7 @@ async function startServer() {
       if (error) throw error;
 
       // Update document status
-      await supabase
+      await getSupabase()
         .from('pdf_documents')
         .update({ status: 'confirmed' })
         .eq('id', id);
