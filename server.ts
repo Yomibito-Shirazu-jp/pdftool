@@ -55,6 +55,17 @@ async function startServer() {
     visionClient = new ImageAnnotatorClient();
   }
 
+  // API: Config - expose Document AI settings to frontend
+  app.get("/api/config", (req, res) => {
+    res.json({
+      processorId: process.env.DOCUMENT_AI_PROCESSOR_ID || '8294184ec60f19aa',
+      projectId: process.env.GOOGLE_CLOUD_PROJECT_ID || 'aidriven-mastering-fyqu',
+      location: process.env.GOOGLE_CLOUD_LOCATION || 'us',
+      hasGemini: !!process.env.GEMINI_API_KEY,
+      hasSupabase: !!process.env.SUPABASE_SERVICE_ROLE_KEY
+    });
+  });
+
   // API: Document AI Detection
   app.post("/api/detect", async (req, res) => {
     try {

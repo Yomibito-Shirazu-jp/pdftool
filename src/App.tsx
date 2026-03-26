@@ -70,9 +70,18 @@ export default function App() {
   const [scanPhase, setScanPhase] = useState<'doc-ai' | 'gemini-correction' | 'polishing'>('doc-ai');
   const [docAIError, setDocAIError] = useState<string | null>(null);
   const [useGeminiOnly, setUseGeminiOnly] = useState(false);
-  const [processorId, setProcessorId] = useState(() => localStorage.getItem('docai_processor_id') || process.env.DOCUMENT_AI_PROCESSOR_ID || '3b937c607d71ab20');
-  const [projectId, setProjectId] = useState(() => localStorage.getItem('docai_project_id') || process.env.GOOGLE_CLOUD_PROJECT_ID || 'aisanbo');
-  const [location, setLocation] = useState(() => localStorage.getItem('docai_location') || process.env.GOOGLE_CLOUD_LOCATION || 'asia-southeast1');
+  const [processorId, setProcessorId] = useState(() => localStorage.getItem('docai_processor_id') || '8294184ec60f19aa');
+  const [projectId, setProjectId] = useState(() => localStorage.getItem('docai_project_id') || 'aidriven-mastering-fyqu');
+  const [location, setLocation] = useState(() => localStorage.getItem('docai_location') || 'us');
+
+  // Auto-sync config from server environment
+  useEffect(() => {
+    fetch('/api/config').then(r => r.json()).then(cfg => {
+      if (cfg.processorId) { setProcessorId(cfg.processorId); localStorage.setItem('docai_processor_id', cfg.processorId); }
+      if (cfg.projectId) { setProjectId(cfg.projectId); localStorage.setItem('docai_project_id', cfg.projectId); }
+      if (cfg.location) { setLocation(cfg.location); localStorage.setItem('docai_location', cfg.location); }
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('docai_processor_id', processorId);
