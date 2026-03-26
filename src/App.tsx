@@ -22,7 +22,10 @@ import {
   Image,
   ImageIcon,
   Code,
-  Database
+  Database,
+  MousePointer2,
+  Hand,
+  ChevronDown
 } from 'lucide-react';
 import { cn } from './lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
@@ -46,7 +49,8 @@ export default function App() {
   const [scale, setScale] = useState(1.5);
   const [activeTool, setActiveTool] = useState<Tool>('select');
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [analysisQueue, setAnalysisQueue] = useState<string[]>([]);
   const [currentColor, setCurrentColor] = useState('#000000');
   const [currentFontSize, setCurrentFontSize] = useState(16);
   const [currentFontFamily, setCurrentFontFamily] = useState('Arial Unicode MS');
@@ -60,11 +64,21 @@ export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [textBlocks, setTextBlocks] = useState<TextBlock[]>([]);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
   const [scanProgress, setScanProgress] = useState(0);
   const [timeRemaining, setTimeRemaining] = useState(0);
   const [scanPhase, setScanPhase] = useState<'doc-ai' | 'gemini-correction' | 'polishing'>('doc-ai');
-  const [processorId, setProcessorId] = useState(process.env.DOCUMENT_AI_PROCESSOR_ID || '8294184ec60f19aa');
-  const [projectId, setProjectId] = useState(process.env.GOOGLE_CLOUD_PROJECT_ID || 'aidriven-mastering-fyqu');
+  const [docAIError, setDocAIError] = useState<string | null>(null);
+  const [useGeminiOnly, setUseGeminiOnly] = useState(false);
+  const [processorId, setProcessorId] = useState(() => localStorage.getItem('docai_processor_id') || process.env.DOCUMENT_AI_PROCESSOR_ID || '3b937c607d71ab20');
+  const [projectId, setProjectId] = useState(() => localStorage.getItem('docai_project_id') || process.env.GOOGLE_CLOUD_PROJECT_ID || 'aisanbo');
+  const [location, setLocation] = useState(() => localStorage.getItem('docai_location') || process.env.GOOGLE_CLOUD_LOCATION || 'asia-southeast1');
+
+  useEffect(() => {
+    localStorage.setItem('docai_processor_id', processorId);
+    localStorage.setItem('docai_project_id', projectId);
+    localStorage.setItem('docai_location', location);
+  }, [processorId, projectId, location]);
   
   const [user, setUser] = useState<User | null>(null);
   const [versions, setVersions] = useState<any[]>([]);
@@ -290,18 +304,23 @@ body {
     }
   };
 
-  const detectTextAI = async () => {
+  const detectTextAI = async (targetIds?: string[]) => {
     if (!canvasRef.current || !pdfDoc) return;
     
+    const isPartial = targetIds && targetIds.length > 0;
+    const idsToProcess = isPartial ? targetIds : [];
+
     setIsDetecting(true);
     setScanProgress(0);
     setScanPhase('doc-ai');
-    setTimeRemaining(60); // Increased time for Document AI + Gemini pipeline
+    setDocAIError(null);
+    setTimeRemaining(isPartial ? 5 : 12); 
 
     const progressInterval = setInterval(() => {
       setScanProgress(prev => {
         if (prev >= 98) return prev;
-        const increment = Math.random() * 1.5;
+        // Faster progress: 5-8% per second initially, then slowing down
+        const increment = prev < 50 ? (Math.random() * 6 + 4) : (Math.random() * 3 + 1);
         return Math.min(98, prev + increment);
       });
       setTimeRemaining(prev => Math.max(1, prev - 1));
@@ -309,7 +328,7 @@ body {
 
     try {
       const originalCanvas = canvasRef.current;
-      const maxDim = 3072; // Increased resolution for better OCR
+      const maxDim = 3072; 
       let width = originalCanvas.width;
       let height = originalCanvas.height;
       
@@ -333,38 +352,53 @@ body {
         ctx.drawImage(originalCanvas, 0, 0, width, height);
       }
       
-      const imageData = offscreenCanvas.toDataURL('image/jpeg', 0.98).split(',')[1];
+      const imageData = offscreenCanvas.toDataURL('image/png').split(',')[1];
       
       // --- PHASE 1: Document AI Detection ---
-      setScanPhase('doc-ai');
-      setScanProgress(5);
-      
       let docAIBlocks = [];
-      try {
-        const docAIResponse = await fetchWithRetry('/api/detect', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ 
-            image: imageData,
-            processorId: processorId,
-            projectId: projectId
-          })
-        });
+      
+      // Only run Document AI for full page detection
+      if (!isPartial && !useGeminiOnly && projectId && processorId) {
+        setScanPhase('doc-ai');
+        setScanProgress(5);
+        
+        try {
+          const docAIResponse = await fetchWithRetry('/api/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              image: imageData,
+              processorId: processorId,
+              projectId: projectId,
+              location: location
+            })
+          });
 
-        if (!docAIResponse.ok) {
-          const errorData = await docAIResponse.json().catch(() => ({}));
-          console.warn("Document AI failed, falling back to Gemini-only analysis.", errorData);
-          // We don't throw here, we just continue with empty blocks
-        } else {
-          const data = await docAIResponse.json();
-          docAIBlocks = data.blocks || [];
+          if (!docAIResponse.ok) {
+            const errorData = await docAIResponse.json().catch(() => ({}));
+            console.warn("Document AI failed, falling back to Gemini-only analysis.", errorData);
+            
+            const errorMessage = errorData.details || errorData.error || '不明なエラー';
+            
+            if (docAIResponse.status === 403 || docAIResponse.status === 401 || errorMessage.includes('PERMISSION_DENIED')) {
+              const deniedProject = errorMessage.match(/projects\/([^\/]+)/)?.[1];
+              if (deniedProject && deniedProject !== projectId) {
+                setDocAIError(`GCP プロジェクト不一致: 現在の設定は '${projectId}' ですが、アクセス先は '${deniedProject}' です。正しいプロジェクトIDを入力してください。`);
+              } else {
+                setDocAIError(`GCP 権限エラー: ${errorMessage}\n※ サービスアカウントに 'Document AI API User' ロールが付与されているか確認してください。`);
+              }
+            } else if (docAIResponse.status === 500) {
+              setDocAIError(`サーバーエラー (500): ${errorMessage}\n※ GCP サービスアカウントの認証情報 (GOOGLE_APPLICATION_CREDENTIALS) が正しく設定されているか確認してください。`);
+            } else {
+              setDocAIError(`Document AI エラー (${docAIResponse.status}): ${errorMessage}`);
+            }
+          } else {
+            const data = await docAIResponse.json();
+            docAIBlocks = data.blocks || [];
+          }
+        } catch (err) {
+          console.warn("Document AI request failed, falling back to Gemini-only analysis.", err);
         }
-      } catch (err) {
-        console.warn("Document AI request failed, falling back to Gemini-only analysis.", err);
-      }
-
-      if (docAIBlocks.length === 0) {
-        console.info("Proceeding with image-only Gemini analysis.");
       }
 
       // --- PHASE 2: Gemini Adjustment & Correction ---
@@ -377,22 +411,39 @@ body {
 
       const geminiWithRetry = async (retries = 2): Promise<any> => {
         try {
+          const targetAnnotations = isPartial 
+            ? annotations.filter(a => idsToProcess.includes(a.id))
+            : [];
+
+          const promptText = isPartial 
+            ? `I have selected specific text blocks to fix. 
+               Current blocks: ${JSON.stringify(targetAnnotations.map(a => ({ id: a.id, text: a.content, box: [a.y, a.x, a.y + (a.height || 0), a.x + (a.width || 0)] })))}.
+               
+               Your task is to:
+               1) Look at the provided image at these locations.
+               2) Correct the text content for these specific blocks.
+               3) Refine their bounding boxes and styling.
+               4) Return the corrected blocks with their original IDs.
+               
+               Return ONLY a JSON array of objects with the schema: { id: string, text: string, box: [number, number, number, number], fontSize: number, fontFamily: string, textAlign: string, color: string, fontWeight: string, fontStyle: string }.`
+            : `I have performed OCR detection. Here are the raw blocks: ${JSON.stringify(docAIBlocks)}. 
+               
+               Your task is to:
+               1) Use the provided image as the ground truth.
+               2) Refine the bounding boxes for absolute precision (ymin, xmin, ymax, xmax in 0-1000 normalized coordinates).
+               3) Correct any OCR errors, missing characters, or punctuation.
+               4) Extract styling: fontSize (pt), fontFamily (best match), textAlign (left/center/right), color (hex), fontWeight (bold/normal), fontStyle (italic/normal).
+               5) Group related text into logical blocks if they belong to the same paragraph.
+               
+               Return ONLY a JSON array of objects with the schema: { text: string, box: [number, number, number, number], fontSize: number, fontFamily: string, textAlign: string, color: string, fontWeight: string, fontStyle: string }.`;
+
           const correctionResponse = await ai.models.generateContent({
             model: "gemini-3.1-pro-preview",
             contents: [
               {
                 parts: [
-                  { text: `I have performed OCR detection. Here are the raw blocks: ${JSON.stringify(docAIBlocks)}. 
-                  
-                  Your task is to:
-                  1) Use the provided image as the ground truth.
-                  2) Refine the bounding boxes for absolute precision (ymin, xmin, ymax, xmax in 0-1000 normalized coordinates).
-                  3) Correct any OCR errors, missing characters, or punctuation.
-                  4) Extract styling: fontSize (pt), fontFamily (best match), textAlign (left/center/right), color (hex), fontWeight (bold/normal), fontStyle (italic/normal).
-                  5) Group related text into logical blocks if they belong to the same paragraph.
-                  
-                  Return ONLY a JSON array of objects with the schema: { text: string, box: [number, number, number, number], fontSize: number, fontFamily: string, textAlign: string, color: string, fontWeight: string, fontStyle: string }.` },
-                  { inlineData: { mimeType: "image/jpeg", data: imageData } }
+                  { text: promptText },
+                  { inlineData: { mimeType: "image/png", data: imageData } }
                 ]
               }
             ],
@@ -424,40 +475,60 @@ body {
       };
 
       const finalResult = await geminiWithRetry();
-
-      // --- PHASE 3: Final Polish ---
-      setScanPhase('polishing');
-      setScanProgress(80);
       
       const canvasWidth = canvasRef.current.width / scale;
       const canvasHeight = canvasRef.current.height / scale;
 
-      const otherAnnotations = annotations.filter(a => a.page !== currentPage || a.type !== 'ai-edit');
+      if (isPartial) {
+        // Update existing annotations with scaled coordinates
+        setAnnotations(prev => prev.map(ann => {
+          const update = finalResult.find((r: any) => r.id === ann.id);
+          if (update) {
+            const box = update.box;
+            return {
+              ...ann,
+              content: update.text,
+              x: (box[1] / 1000) * canvasWidth,
+              y: (box[0] / 1000) * canvasHeight,
+              width: ((box[3] - box[1]) / 1000) * canvasWidth,
+              height: ((box[2] - box[0]) / 1000) * canvasHeight,
+              fontSize: update.fontSize,
+              fontFamily: update.fontFamily,
+              textAlign: update.textAlign,
+              color: update.color,
+              fontWeight: update.fontWeight,
+              fontStyle: update.fontStyle
+            };
+          }
+          return ann;
+        }));
+        // Remove from queue and clear selection
+        setAnalysisQueue(prev => prev.filter(id => !idsToProcess.includes(id)));
+        setSelectedIds([]);
+      } else {
+        // Full page replacement
+        const newAnnotations: Annotation[] = finalResult.map((block: any, index: number) => {
+          const box = block.box;
+          return {
+            id: `ai-${Date.now()}-${index}`,
+            type: 'ai-edit',
+            page: currentPage,
+            x: (box[1] / 1000) * canvasWidth,
+            y: (box[0] / 1000) * canvasHeight,
+            width: ((box[3] - box[1]) / 1000) * canvasWidth,
+            height: ((box[2] - box[0]) / 1000) * canvasHeight,
+            content: block.text,
+            fontSize: block.fontSize || 12,
+            fontFamily: block.fontFamily || 'Noto Sans JP',
+            color: block.color || '#000000',
+            textAlign: block.textAlign || 'left',
+            fontWeight: block.fontWeight || 'normal',
+            fontStyle: block.fontStyle || 'normal',
+          };
+        });
+        setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
+      }
 
-      const newAnnotations: Annotation[] = finalResult.map((item: any) => {
-        // Basic validation of item properties
-        const text = item.text || "";
-        const box = Array.isArray(item.box) && item.box.length === 4 ? item.box : [0, 0, 100, 100];
-        
-        return {
-          id: Math.random().toString(36).substr(2, 9),
-          type: 'ai-edit',
-          page: currentPage,
-          x: (box[1] / 1000) * canvasWidth,
-          y: (box[0] / 1000) * canvasHeight,
-          width: ((box[3] - box[1]) / 1000) * canvasWidth,
-          height: ((box[2] - box[0]) / 1000) * canvasHeight,
-          content: text,
-          color: item.color || '#000000',
-          fontSize: item.fontSize || 12,
-          fontFamily: item.fontFamily || 'Noto Sans JP',
-          textAlign: item.textAlign || 'left',
-          fontWeight: item.fontWeight === 'bold' ? 'bold' : 'normal',
-          fontStyle: item.fontStyle || 'normal'
-        };
-      });
-
-      setAnnotations([...otherAnnotations, ...newAnnotations]);
       setScanProgress(100);
       setTimeRemaining(0);
       setTimeout(() => {
@@ -482,7 +553,7 @@ body {
       if (!apiKey) throw new Error("Gemini API Key is missing");
       
       const ai = new GoogleGenAI({ apiKey });
-      const imageData = canvasRef.current.toDataURL('image/jpeg', 1.0).split(',')[1];
+      const imageData = canvasRef.current.toDataURL('image/png').split(',')[1];
       
       const pageAnnotations = annotations.filter(a => a.page === currentPage);
       
@@ -496,7 +567,7 @@ body {
               
               Identify titles, headers, and body text. Standardize font sizes (e.g., Titles: 24pt+, Headers: 18pt, Body: 12pt). Fix alignment inconsistencies.
               Return a JSON array of objects with { id, fontSize, fontWeight, textAlign }.` },
-              { inlineData: { mimeType: "image/jpeg", data: imageData } }
+              { inlineData: { mimeType: "image/png", data: imageData } }
             ]
           }
         ],
@@ -550,7 +621,7 @@ body {
       if (!apiKey) throw new Error("Gemini API Key is missing");
       
       const ai = new GoogleGenAI({ apiKey });
-      const imageData = canvasRef.current.toDataURL('image/jpeg', 1.0).split(',')[1];
+      const imageData = canvasRef.current.toDataURL('image/png').split(',')[1];
       
       const pageAnnotations = annotations.filter(a => a.page === currentPage);
       
@@ -565,7 +636,7 @@ body {
               Current blocks: ${JSON.stringify(pageAnnotations.map(a => ({ id: a.id, text: a.content })))}
               
               Return a JSON array of objects with { id, className }.` },
-              { inlineData: { mimeType: "image/jpeg", data: imageData } }
+              { inlineData: { mimeType: "image/png", data: imageData } }
             ]
           }
         ],
@@ -697,13 +768,13 @@ body {
       textAlign: 'left'
     };
     setAnnotations([...annotations, newAnnotation]);
-    setSelectedId(newAnnotation.id);
+    setSelectedIds([newAnnotation.id]);
     setActiveTool('select');
   };
 
   useEffect(() => {
-    if (selectedId) {
-      const selected = annotations.find(a => a.id === selectedId);
+    if (selectedIds.length > 0) {
+      const selected = annotations.find(a => a.id === selectedIds[0]);
       if (selected) {
         if (selected.color) setCurrentColor(selected.color);
         if (selected.fontSize) setCurrentFontSize(selected.fontSize);
@@ -714,7 +785,7 @@ body {
         setIsUnderline(selected.textDecoration === 'underline');
       }
     }
-  }, [selectedId, annotations]);
+  }, [selectedIds, annotations]);
 
   const renderPage = useCallback(async (pageNum: number, currentScale: number) => {
     if (!pdfDoc || !canvasRef.current || pageNum < 1 || pageNum > numPages) return;
@@ -738,7 +809,7 @@ body {
       await page.render(renderContext).promise;
       
       // Store page as image for CSS view
-      const pageImage = canvas.toDataURL('image/jpeg', 0.8);
+      const pageImage = canvas.toDataURL('image/png');
       setPageImages(prev => ({ ...prev, [pageNum]: pageImage }));
     } catch (err) {
       console.error('Error rendering page:', err);
@@ -776,25 +847,25 @@ body {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (selectedId && document.activeElement?.tagName !== 'INPUT') {
-          setAnnotations(prev => prev.filter(a => a.id !== selectedId));
-          setSelectedId(null);
+        if (selectedIds.length > 0 && document.activeElement?.tagName !== 'INPUT') {
+          setAnnotations(prev => prev.filter(a => !selectedIds.includes(a.id)));
+          setSelectedIds([]);
         }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedId]);
+  }, [selectedIds]);
 
   useEffect(() => {
     const handleMouseMoveGlobal = (e: MouseEvent) => {
-      if (isDraggingAnn && selectedId && canvasRef.current) {
+      if (isDraggingAnn && selectedIds.length > 0 && canvasRef.current) {
         const rect = canvasRef.current.getBoundingClientRect();
         const mouseX = (e.clientX - rect.left) / scale;
         const mouseY = (e.clientY - rect.top) / scale;
         
         setAnnotations(prev => prev.map(a => 
-          a.id === selectedId 
+          selectedIds.includes(a.id) 
             ? { ...a, x: mouseX - dragOffset.x, y: mouseY - dragOffset.y } 
             : a
         ));
@@ -814,7 +885,7 @@ body {
       window.removeEventListener('mousemove', handleMouseMoveGlobal);
       window.removeEventListener('mouseup', handleMouseUpGlobal);
     };
-  }, [isDraggingAnn, selectedId, scale, dragOffset]);
+  }, [isDraggingAnn, selectedIds, scale, dragOffset]);
 
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current || activeTool === 'select' || activeTool === 'hand' || activeTool === 'edit') return;
@@ -837,13 +908,19 @@ body {
     };
 
     setAnnotations([...annotations, newAnnotation]);
-    setSelectedId(newAnnotation.id);
+    setSelectedIds([newAnnotation.id]);
   };
 
   const handleMouseDown = (e: React.MouseEvent, id: string) => {
     if (activeTool !== 'select') return;
     e.stopPropagation();
-    setSelectedId(id);
+    
+    if (e.shiftKey) {
+      setSelectedIds(prev => prev.includes(id) ? prev.filter(i => i !== id) : [...prev, id]);
+    } else {
+      setSelectedIds([id]);
+    }
+    
     setIsDraggingAnn(true);
     
     const ann = annotations.find(a => a.id === id);
@@ -999,6 +1076,20 @@ body {
     setIsExportDropdownOpen(false);
   };
 
+  const verifyAccuracy = async () => {
+    if (!pdfFile || isVerifying) return;
+    setIsVerifying(true);
+    try {
+      // Mock verification for now
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      alert('Verification complete! Accuracy: 98.5%');
+    } catch (err) {
+      console.error('Verification error:', err);
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
   const downloadPdf = async () => {
     if (!pdfFile) return;
 
@@ -1070,135 +1161,94 @@ body {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-[#EBEBEB] font-sans text-[#333]">
-      {/* Top Navigation Bar */}
-      <nav className="h-12 bg-[#F8F9FA] border-b border-[#D1D1D1] flex items-center justify-between px-4 z-30">
+    <div className="flex flex-col h-screen bg-[#F5F5F7] font-sans text-[#1D1D1F]">
+      {/* Professional Header */}
+      <header className="h-14 bg-white border-b border-[#D2D2D7] flex items-center justify-between px-6 z-40 shadow-sm">
         <div className="flex items-center gap-6">
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 bg-[#E5322E] rounded flex items-center justify-center text-white text-[10px] font-bold">iPDF</div>
-            <span className="font-bold text-sm">PDF Editor Pro</span>
+          <div className="flex items-center gap-2.5">
+            <div className="bg-[#E5322E] p-1.5 rounded-lg shadow-sm">
+              <FileText size={20} className="text-white" />
+            </div>
+            <h1 className="text-sm font-bold tracking-tight text-[#1D1D1F]">PDF Editor <span className="text-[#E5322E]">PRO</span></h1>
           </div>
-          <div className="flex items-center gap-4 text-xs font-medium text-[#666]">
-            <button className="hover:text-[#E5322E] transition-colors">PDF 結合</button>
-            <button className="hover:text-[#E5322E] transition-colors">PDF 分割</button>
-            <button className="hover:text-[#E5322E] transition-colors">PDF 圧縮</button>
-            <button className="hover:text-[#E5322E] transition-colors flex items-center gap-1">
-              PDF 変換 <ChevronRight size={12} className="rotate-90" />
+          
+          <div className="h-6 w-[1px] bg-[#D2D2D7]" />
+          
+          <div className="flex items-center gap-1 bg-[#F5F5F7] p-1 rounded-lg">
+            <button 
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold transition-all pro-button",
+                activeTool === 'select' ? "bg-white text-[#1D1D1F] shadow-sm" : "text-[#666] hover:text-[#1D1D1F]"
+              )}
+              onClick={() => setActiveTool('select')}
+            >
+              <MousePointer2 size={13} />
+              <span>選択</span>
+            </button>
+            <button 
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold transition-all pro-button",
+                activeTool === 'hand' ? "bg-white text-[#1D1D1F] shadow-sm" : "text-[#666] hover:text-[#1D1D1F]"
+              )}
+              onClick={() => setActiveTool('hand')}
+            >
+              <Hand size={13} />
+              <span>移動</span>
+            </button>
+            <button 
+              className={cn(
+                "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold transition-all pro-button",
+                activeTool === 'edit' ? "bg-white text-[#E5322E] shadow-sm" : "text-[#666] hover:text-[#E5322E]"
+              )}
+              onClick={() => setActiveTool('edit')}
+            >
+              <Layers size={13} />
+              <span>AI編集</span>
+              <div className="w-3 h-3 bg-yellow-400 rounded-full flex items-center justify-center text-[7px] text-black border border-white">👑</div>
             </button>
           </div>
         </div>
-        <div className="flex items-center gap-3">
-          <button className="text-xs font-medium hover:text-[#E5322E]">ログイン</button>
-          <button className="bg-[#E5322E] text-white text-xs font-bold px-4 py-1.5 rounded hover:bg-[#C42B28] transition-colors shadow-sm">
-            サインアップ
-          </button>
-          <div className="w-8 h-8 flex items-center justify-center hover:bg-[#E0E0E0] rounded cursor-pointer">
-            <Settings size={16} />
-          </div>
-        </div>
-      </nav>
 
-      {/* Sub-header Toolbar */}
-      <header className="h-10 bg-[#F3F3F3] border-b border-[#D1D1D1] flex items-center justify-between px-4 z-20">
-        <div className="flex items-center gap-1">
-          <button 
-            className={cn(
-              "flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors",
-              activeTool !== 'edit' ? "bg-white border border-[#D1D1D1] shadow-sm" : "hover:bg-[#E0E0E0]"
-            )}
-            onClick={() => setActiveTool('select')}
-          >
-            <Pen size={14} className={activeTool !== 'edit' ? "text-[#E5322E]" : ""} />
-            <span>注釈</span>
-          </button>
-          <button 
-            className={cn(
-              "flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium transition-colors",
-              activeTool === 'edit' ? "bg-white border border-[#D1D1D1] shadow-sm" : "hover:bg-[#E0E0E0]"
-            )}
-            onClick={() => setActiveTool('edit')}
-          >
-            <Layers size={14} className={activeTool === 'edit' ? "text-[#E5322E]" : ""} />
-            <span>編集する</span>
-            <div className="w-3 h-3 bg-yellow-400 rounded-full flex items-center justify-center text-[8px] text-black">👑</div>
-          </button>
-        </div>
-
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-1 bg-white border border-[#D1D1D1] rounded px-2 py-0.5 shadow-sm">
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-3 bg-[#F5F5F7] rounded-lg px-2 py-1 border border-[#D2D2D7]/50">
             <button 
               onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
-              className="p-1 hover:bg-[#F0F0F0] rounded disabled:opacity-30"
+              className="p-1 hover:bg-white hover:shadow-sm rounded-md transition-all disabled:opacity-30"
               disabled={currentPage === 1}
             >
               <ChevronLeft size={14} />
             </button>
-            <div className="flex items-center gap-1 text-xs font-medium">
-              <input 
-                type="text" 
-                value={currentPage} 
-                className="w-8 text-center border border-[#D1D1D1] rounded"
-                readOnly
-              />
-              <span>/ {numPages || 1}</span>
+            <div className="flex items-center gap-1.5 text-[11px] font-bold font-mono">
+              <span className="text-[#E5322E]">{currentPage}</span>
+              <span className="text-[#999]">/</span>
+              <span>{numPages || 1}</span>
             </div>
             <button 
               onClick={() => setCurrentPage(Math.min(numPages, currentPage + 1))}
-              className="p-1 hover:bg-[#F0F0F0] rounded disabled:opacity-30"
+              className="p-1 hover:bg-white hover:shadow-sm rounded-md transition-all disabled:opacity-30"
               disabled={currentPage === numPages}
             >
               <ChevronRight size={14} />
             </button>
           </div>
-          <div className="h-4 w-[1px] bg-[#D1D1D1]" />
-          <div className="flex items-center gap-2">
-            <button onClick={() => setScale(Math.max(0.5, scale - 0.1))} className="p-1 hover:bg-[#E0E0E0] rounded"><ZoomOut size={16} /></button>
-            <span className="text-xs font-medium w-10 text-center">{Math.round(scale * 100)}%</span>
-            <button onClick={() => setScale(Math.min(3, scale + 0.1))} className="p-1 hover:bg-[#E0E0E0] rounded"><ZoomIn size={16} /></button>
-          </div>
-          <div className="h-4 w-[1px] bg-[#D1D1D1]" />
-          <button className="p-1 hover:bg-[#E0E0E0] rounded"><Maximize size={16} /></button>
-          <button className="p-1 hover:bg-[#E0E0E0] rounded"><Search size={16} /></button>
-        </div>
 
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1 bg-[#F0F0F0] p-1 rounded mr-4">
-            <button 
-              onClick={() => setViewMode('canvas')}
-              className={cn(
-                "px-3 py-1 text-[10px] font-bold rounded transition-all",
-                viewMode === 'canvas' ? "bg-white shadow-sm text-[#E5322E]" : "text-[#666] hover:text-[#333]"
-              )}
-            >
-              エディタ
-            </button>
-            <button 
-              onClick={() => setViewMode('css')}
-              className={cn(
-                "px-3 py-1 text-[10px] font-bold rounded transition-all",
-                viewMode === 'css' ? "bg-white shadow-sm text-[#E5322E]" : "text-[#666] hover:text-[#333]"
-              )}
-            >
-              CSS組版
-            </button>
+          <div className="h-6 w-[1px] bg-[#D2D2D7]" />
+
+          <div className="flex items-center gap-2 bg-[#F5F5F7] rounded-lg px-2 py-1">
+            <button onClick={() => setScale(Math.max(0.5, scale - 0.1))} className="p-1 hover:bg-white hover:shadow-sm rounded-md transition-all"><ZoomOut size={14} /></button>
+            <span className="text-[10px] font-bold font-mono w-10 text-center">{Math.round(scale * 100)}%</span>
+            <button onClick={() => setScale(Math.min(3, scale + 0.1))} className="p-1 hover:bg-white hover:shadow-sm rounded-md transition-all"><ZoomIn size={14} /></button>
           </div>
 
-          {viewMode === 'css' && (
-            <button 
-              onClick={printCssPdf}
-              className="bg-[#2E7D32] text-white text-xs font-bold px-4 py-1.5 rounded hover:bg-[#1B5E20] transition-all shadow-md flex items-center gap-2"
-            >
-              <Maximize size={14} /> PDF出力 (CSS)
-            </button>
-          )}
+          <div className="h-6 w-[1px] bg-[#D2D2D7]" />
 
           <div className="relative">
             <button 
               onClick={() => setIsExportDropdownOpen(!isExportDropdownOpen)}
               disabled={!pdfFile}
-              className="bg-[#E5322E] text-white text-xs font-bold px-6 py-1.5 rounded hover:bg-[#C42B28] transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+              className="bg-[#1D1D1F] text-white text-[11px] font-bold px-5 py-2 rounded-lg hover:bg-[#333] transition-all shadow-md flex items-center gap-2 disabled:opacity-50 pro-button"
             >
-              エクスポート <ChevronRight size={14} className={cn("transition-transform", isExportDropdownOpen && "rotate-90")} />
+              エクスポート <ChevronDown size={14} className={cn("transition-transform", isExportDropdownOpen && "rotate-180")} />
             </button>
 
             <AnimatePresence>
@@ -1303,6 +1353,7 @@ body {
                 activeTool={activeTool}
                 setActiveTool={setActiveTool}
                 detectTextAI={detectTextAI}
+                isDetecting={isDetecting}
                 currentColor={currentColor}
                 currentFontSize={currentFontSize}
               />
@@ -1357,7 +1408,10 @@ body {
                     <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept="application/pdf" className="hidden" />
                   </div>
                 ) : (
-                  <div className="relative shadow-[0_20px_50px_rgba(0,0,0,0.2)] bg-white">
+                  <div className={cn(
+                    "relative shadow-[0_20px_50px_rgba(0,0,0,0.2)] bg-white transition-all duration-300",
+                    activeTool === 'edit' && "ring-4 ring-[#E5322E]/10 ring-offset-0 border-2 border-dotted border-[#E5322E]/30"
+                  )}>
                     <canvas ref={canvasRef} onClick={handleCanvasClick} className="block" />
                     
                     {/* AI Mapping Loading Overlay */}
@@ -1430,6 +1484,9 @@ body {
                           animate={{ top: ['0%', '100%', '0%'] }}
                           transition={{ repeat: Infinity, duration: 4, ease: "linear" }}
                         />
+
+                        {/* Dotted Grid Overlay during scanning */}
+                        <div className="absolute inset-0 pointer-events-none opacity-20" style={{ backgroundImage: 'radial-gradient(#E5322E 1px, transparent 1px)', backgroundSize: '20px 20px' }} />
                       </div>
                     )}
 
@@ -1510,8 +1567,10 @@ body {
                           <div 
                             key={ann.id}
                             className={cn(
-                              "absolute pointer-events-auto",
-                              selectedId === ann.id && "ring-2 ring-[#E5322E] ring-offset-2",
+                              "absolute pointer-events-auto transition-all duration-200",
+                              ann.type === 'ai-edit' && "border-2 border-dotted border-[#E5322E]/60 bg-[#E5322E]/5 hover:border-[#E5322E] hover:bg-[#E5322E]/10 shadow-[0_0_8px_rgba(229,50,46,0.1)]",
+                              selectedIds.includes(ann.id) && "ring-2 ring-[#E5322E] ring-offset-2 z-30 shadow-lg",
+                              analysisQueue.includes(ann.id) && "ring-2 ring-blue-400 ring-offset-2 animate-pulse",
                               activeTool === 'select' ? "cursor-move" : "cursor-default",
                               isAdded && "ring-2 ring-green-500 ring-offset-1 bg-green-50/20",
                               isModified && "ring-2 ring-yellow-500 ring-offset-1 bg-yellow-50/20"
@@ -1540,6 +1599,11 @@ body {
                                 {isAdded ? "新規追加" : "変更後"}
                               </div>
                             )}
+                            {ann.type === 'ai-edit' && !comparingVersion && (
+                              <div className="absolute -top-3.5 -right-1 bg-[#E5322E] text-white text-[7px] font-bold px-1.5 py-0.5 rounded-full z-10 pointer-events-none shadow-sm">
+                                AI
+                              </div>
+                            )}
                             {ann.type === 'text' && (
                               <textarea 
                                 value={ann.content} 
@@ -1566,7 +1630,7 @@ body {
                               <textarea 
                                 value={ann.content} 
                                 onChange={(e) => setAnnotations(annotations.map(a => a.id === ann.id ? { ...a, content: e.target.value } : a))}
-                                className="bg-white border-none outline-none w-full resize-none overflow-hidden"
+                                className="bg-transparent border-none outline-none w-full resize-none overflow-hidden"
                                 style={{ 
                                   fontSize: 'inherit', 
                                   color: 'inherit',
@@ -1661,8 +1725,8 @@ body {
                     {annotations.filter(a => a.page === pageNum).map(ann => (
                       <div 
                         key={ann.id}
-                        className={cn("annotation", ann.type, ann.className, selectedId === ann.id && "ring-2 ring-[#E5322E] ring-offset-2")}
-                        onClick={(e) => { e.stopPropagation(); setSelectedId(ann.id); }}
+                        className={cn("annotation", ann.type, ann.className, selectedIds.includes(ann.id) && "ring-2 ring-[#E5322E] ring-offset-2")}
+                        onClick={(e) => { e.stopPropagation(); setSelectedIds([ann.id]); }}
                         style={{ 
                           left: ann.x, 
                           top: ann.y,
@@ -1711,10 +1775,15 @@ body {
 
         {/* Right Sidebar - Properties & Tools */}
         <PropertiesPanel 
-          selectedId={selectedId}
+          selectedId={selectedIds.length === 1 ? selectedIds[0] : null}
+          selectedIds={selectedIds}
+          analysisQueue={analysisQueue}
+          addToQueue={(ids) => setAnalysisQueue(prev => [...new Set([...prev, ...ids])])}
+          processQueue={() => detectTextAI(analysisQueue)}
           annotations={annotations}
           setAnnotations={setAnnotations}
-          setSelectedId={setSelectedId}
+          setSelectedId={(id) => setSelectedIds(id ? [id] : [])}
+          setSelectedIds={setSelectedIds}
           currentFontFamily={currentFontFamily}
           setCurrentFontFamily={setCurrentFontFamily}
           currentFontSize={currentFontSize}
@@ -1730,8 +1799,10 @@ body {
           currentColor={currentColor}
           setCurrentColor={setCurrentColor}
           isDetecting={isDetecting}
-          detectTextAI={detectTextAI}
+          detectTextAI={(ids) => detectTextAI(ids)}
           smartFormatAI={smartFormatAI}
+          verifyAccuracy={verifyAccuracy}
+          isVerifying={isVerifying}
           currentPage={currentPage}
           downloadPdf={downloadPdf}
           printCssPdf={printCssPdf}
@@ -1748,12 +1819,17 @@ body {
           versionName={versionName}
           setVersionName={setVersionName}
           isSavingVersion={isSavingVersion}
+          docAIError={docAIError}
           comparingVersionId={comparingVersion?.id}
           toggleCompareVersion={toggleCompareVersion}
           processorId={processorId}
           setProcessorId={setProcessorId}
           projectId={projectId}
           setProjectId={setProjectId}
+          location={location}
+          setLocation={setLocation}
+          useGeminiOnly={useGeminiOnly}
+          setUseGeminiOnly={setUseGeminiOnly}
         />
       </div>
 

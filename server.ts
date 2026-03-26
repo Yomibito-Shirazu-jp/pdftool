@@ -35,28 +35,49 @@ async function startServer() {
   app.post("/api/detect", async (req, res) => {
     try {
       const { image, processorId, projectId, location } = req.body;
-      console.log(`Processing request for Project: ${projectId}, Processor: ${processorId}`);
       
       const effectiveProjectId = projectId || process.env.GOOGLE_CLOUD_PROJECT_ID;
       const effectiveLocation = location || process.env.GOOGLE_CLOUD_LOCATION || "us";
       const effectiveProcessorId = processorId || process.env.DOCUMENT_AI_PROCESSOR_ID;
 
-      if (!effectiveProcessorId) {
-        return res.status(400).json({ error: "Document AI Processor ID is missing. Please set it in .env or provide it in the request." });
+      console.log(`Processing request for Project: ${effectiveProjectId}, Location: ${effectiveLocation}, Processor: ${effectiveProcessorId}`);
+
+      if (!effectiveProjectId) {
+        return res.status(400).json({ error: "GCP プロジェクトIDが設定されていません。サイドバーで入力するか、環境変数を設定してください。" });
       }
 
+      if (!effectiveProcessorId) {
+        return res.status(400).json({ error: "Document AI プロセッサーIDが設定されていません。" });
+      }
+
+      // リージョンに応じたエンドポイントの設定
+      const clientOptions: any = {};
+      const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS 
+        ? JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS) 
+        : undefined;
+      
+      if (credentials) clientOptions.credentials = credentials;
+      if (effectiveProjectId) clientOptions.projectId = effectiveProjectId;
+      
+      // us 以外の場合はリージョン指定のエンドポイントが必要
+      if (effectiveLocation && effectiveLocation !== 'us') {
+        clientOptions.apiEndpoint = `${effectiveLocation}-documentai.googleapis.com`;
+      }
+
+      const regionalClient = new DocumentProcessorServiceClient(clientOptions);
       const name = `projects/${effectiveProjectId}/locations/${effectiveLocation}/processors/${effectiveProcessorId}`;
       
       const request = {
         name,
         rawDocument: {
           content: image,
-          mimeType: "image/jpeg",
+          mimeType: "image/png",
         },
       };
 
-      const [result] = await docAIClient.processDocument(request);
+      const [result] = await regionalClient.processDocument(request);
       const { document } = result;
+      console.log("Document AI processing completed successfully.");
 
       // Extract layout and text with fallback mechanisms
       let blocks: any[] = [];
@@ -118,8 +139,17 @@ async function startServer() {
 
       res.json({ blocks: blocks.filter(b => b.text && b.text.length > 0) });
     } catch (error: any) {
-      console.error("Document AI Error:", error);
-      res.status(500).json({ error: error.message });
+      console.error("Document AI Error Details:", {
+        message: error.message,
+        code: error.code,
+        details: error.details,
+        stack: error.stack
+      });
+      res.status(500).json({ 
+        error: "Document AI 処理中にエラーが発生しました。",
+        details: error.message,
+        code: error.code
+      });
     }
   });
 

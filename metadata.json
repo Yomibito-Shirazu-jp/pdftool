@@ -1,5 +1,6 @@
 {
   "name": "PDF Editor Pro",
+  "id": "pdf-editor-pro-app",
   "description": "A powerful web-based PDF editor for viewing, annotating, and editing PDF documents.",
   "requestFramePermissions": []
 }
