@@ -2,15 +2,21 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import { DocumentProcessorServiceClient } from "@google-cloud/documentai";
 import { ImageAnnotatorClient } from "@google-cloud/vision";
+import { createClient } from "@supabase/supabase-js";
 import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
 
 dotenv.config();
 
+// Supabase client (server-side with service_role key)
+const supabaseUrl = process.env.SUPABASE_URL || 'https://avakiygdyafqjrhlvbjg.supabase.co';
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || '3000');
 
   app.use(express.json({ limit: '50mb' }));
 
@@ -227,6 +233,148 @@ async function startServer() {
         error: "Vision API 処理中にエラーが発生しました。",
         details: error.message
       });
+    }
+  });
+
+  // ================================================================
+  // Supabase CRUD APIs - DB-backed OCR pipeline
+  // ================================================================
+
+  // POST /api/documents — Create document + save extracted blocks
+  app.post('/api/documents', async (req, res) => {
+    try {
+      const { firebase_uid, filename, page_count, blocks } = req.body;
+      if (!firebase_uid || !filename) {
+        return res.status(400).json({ error: 'firebase_uid and filename are required' });
+      }
+
+      // Create document record
+      const { data: doc, error: docError } = await supabase
+        .from('pdf_documents')
+        .insert({ firebase_uid, filename, page_count: page_count || 0, status: 'extracted' })
+        .select('id')
+        .single();
+
+      if (docError) throw docError;
+
+      // Insert blocks if provided
+      if (blocks && Array.isArray(blocks) && blocks.length > 0) {
+        const blockRecords = blocks.map((b: any, i: number) => ({
+          document_id: doc.id,
+          page_number: b.page || 1,
+          bbox_top: b.box?.[0] ?? 0,
+          bbox_left: b.box?.[1] ?? 0,
+          bbox_bottom: b.box?.[2] ?? 0,
+          bbox_right: b.box?.[3] ?? 0,
+          ocr_text: b.text || '',
+          gemini_text: b.gemini_text || null,
+          font_size: b.fontSize || 12,
+          font_family: b.fontFamily || 'Noto Sans JP',
+          font_weight: b.fontWeight || 'normal',
+          font_style: b.fontStyle || 'normal',
+          text_align: b.textAlign || 'left',
+          color: b.color || '#000000',
+          source: b.source || 'docai',
+          confidence: b.confidence || 0,
+          sort_order: i
+        }));
+
+        const { error: blocksError } = await supabase
+          .from('extracted_blocks')
+          .insert(blockRecords);
+
+        if (blocksError) throw blocksError;
+      }
+
+      res.json({ document_id: doc.id, block_count: blocks?.length || 0 });
+    } catch (error: any) {
+      console.error('POST /api/documents error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // GET /api/documents/:id/blocks — Fetch all blocks for a document
+  app.get('/api/documents/:id/blocks', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const page = req.query.page ? parseInt(req.query.page as string) : undefined;
+
+      let query = supabase
+        .from('extracted_blocks')
+        .select('*')
+        .eq('document_id', id)
+        .order('page_number')
+        .order('sort_order');
+
+      if (page) query = query.eq('page_number', page);
+
+      const { data, error } = await query;
+      if (error) throw error;
+
+      res.json({ blocks: data });
+    } catch (error: any) {
+      console.error('GET /api/documents/:id/blocks error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // PATCH /api/blocks/:id — Update a single block (user edit)
+  app.patch('/api/blocks/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updates: any = {};
+      
+      // Allow updating specific fields
+      const allowed = ['user_text', 'gemini_text', 'font_size', 'font_family', 'font_weight', 'font_style', 'text_align', 'color', 'is_confirmed'];
+      for (const key of allowed) {
+        if (req.body[key] !== undefined) updates[key] = req.body[key];
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+      }
+
+      const { data, error } = await supabase
+        .from('extracted_blocks')
+        .update(updates)
+        .eq('id', id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      res.json({ block: data });
+    } catch (error: any) {
+      console.error('PATCH /api/blocks/:id error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // POST /api/documents/:id/confirm — Confirm all blocks on a page
+  app.post('/api/documents/:id/confirm', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { page } = req.body;
+
+      let query = supabase
+        .from('extracted_blocks')
+        .update({ is_confirmed: true })
+        .eq('document_id', id);
+
+      if (page) query = query.eq('page_number', page);
+
+      const { data, error } = await query.select();
+      if (error) throw error;
+
+      // Update document status
+      await supabase
+        .from('pdf_documents')
+        .update({ status: 'confirmed' })
+        .eq('id', id);
+
+      res.json({ confirmed_count: data?.length || 0 });
+    } catch (error: any) {
+      console.error('POST /api/documents/:id/confirm error:', error);
+      res.status(500).json({ error: error.message });
     }
   });
 

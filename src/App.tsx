@@ -224,6 +224,72 @@ body {
     }
   };
 
+  // Supabase document ID for current session
+  const [supabaseDocId, setSupabaseDocId] = useState<string | null>(null);
+
+  // Auto-save OCR results to Supabase via server API
+  const saveOCRResults = async (newAnnotations: Annotation[], source?: string) => {
+    if (!user || !pdfFile) return;
+    try {
+      // Convert annotations to block format for Supabase
+      const blocks = newAnnotations.map(ann => ({
+        page: ann.page,
+        box: [
+          (ann.y / (canvasRef.current?.height || 1)) * 1000,
+          (ann.x / (canvasRef.current?.width || 1)) * 1000,
+          ((ann.y + (ann.height || 0)) / (canvasRef.current?.height || 1)) * 1000,
+          ((ann.x + (ann.width || 0)) / (canvasRef.current?.width || 1)) * 1000,
+        ],
+        text: ann.content,
+        fontSize: ann.fontSize,
+        fontFamily: ann.fontFamily,
+        fontWeight: ann.fontWeight,
+        fontStyle: ann.fontStyle,
+        textAlign: ann.textAlign,
+        color: ann.color,
+        source: source || 'docai',
+      }));
+
+      const response = await fetch('/api/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          firebase_uid: user.uid,
+          filename: pdfFile.name,
+          page_count: numPages,
+          blocks
+        })
+      });
+
+      if (!response.ok) throw new Error('Failed to save to Supabase');
+      const data = await response.json();
+      setSupabaseDocId(data.document_id);
+      console.log(`OCR results saved to Supabase (doc: ${data.document_id}, ${data.block_count} blocks)`);
+    } catch (error) {
+      console.warn('Failed to save OCR results:', error);
+    }
+  };
+
+  // Save confirmed annotations via Supabase API  
+  const saveConfirmedToFirestore = async (_confirmedAnnotations: Annotation[]) => {
+    if (!supabaseDocId) {
+      console.warn('No Supabase document ID, skipping confirm');
+      return;
+    }
+    try {
+      const response = await fetch(`/api/documents/${supabaseDocId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page: currentPage })
+      });
+      if (!response.ok) throw new Error('Failed to confirm');
+      const data = await response.json();
+      console.log(`Confirmed ${data.confirmed_count} blocks in Supabase`);
+    } catch (error) {
+      console.warn('Failed to confirm:', error);
+    }
+  };
+
   const revertToVersion = (version: any) => {
     setAnnotations(version.annotations);
     setComparingVersion(null);
@@ -719,6 +785,9 @@ ${blocks.map((b: any, i: number) => `[${i}] "${b.text}"`).join('\n')}
           };
         });
         setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
+        
+        // Auto-save OCR results to Firestore
+        saveOCRResults(newAnnotations, 'docai+gemini');
       }
 
       setScanProgress(100);
@@ -1271,11 +1340,16 @@ body {
   };
 
   const confirmAll = () => {
-    setAnnotations(prev => prev.map(ann => 
+    const updated = annotations.map(ann => 
       ann.page === currentPage && ann.type === 'ai-edit' 
         ? { ...ann, isConfirmed: true } 
         : ann
-    ));
+    );
+    setAnnotations(updated);
+    
+    // Save confirmed annotations to Firestore
+    const confirmedOnPage = updated.filter(a => a.page === currentPage && a.isConfirmed);
+    saveConfirmedToFirestore(confirmedOnPage);
   };
 
   const verifyAccuracy = async () => {
@@ -1347,7 +1421,7 @@ body {
     }
 
     const pdfBytes = await pdfDoc.save();
-    const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+    const blob = new Blob([pdfBytes as unknown as ArrayBuffer], { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
