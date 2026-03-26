@@ -1,0 +1,8 @@
+{
+  "buildCommand": "npx vite build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://pdftool-270124753853.asia-northeast1.run.app/api/:path*" }
+  ]
+}
