@@ -25,6 +25,8 @@ export interface Annotation {
   isConfirmed?: boolean;
   dbBlockId?: string;
   opacity?: number;
+  /** OCR検出時の元テキスト（PDF.co置換用） */
+  originalText?: string;
 }
 
 export interface TextBlock {

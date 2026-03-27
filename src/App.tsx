@@ -24,6 +24,9 @@ import {
   Code,
   Database,
   MousePointer2,
+  Lock,
+  MessageSquareDiff,
+  AlertTriangle,
   Hand,
   ChevronDown
 } from 'lucide-react';
@@ -639,6 +642,7 @@ body {
               width: ((box[3] - box[1]) / 1000) * canvasWidth,
               height: ((box[2] - box[0]) / 1000) * canvasHeight,
               content: block.text,
+              originalText: block.originalText || block.text, // ← OCR元テキストを保存
               fontSize: block.fontSize || 12,
               fontFamily: block.fontFamily || 'Noto Sans JP',
               color: block.color || '#000000',

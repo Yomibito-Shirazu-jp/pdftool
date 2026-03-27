@@ -388,6 +388,7 @@ async function startServer() {
       // ── PHASE 3: Gemini document understanding + structuring ──
       const geminiKey = process.env.GEMINI_API_KEY;
       let styledBlocks: any[] = [];
+      let geminiCorrections: any[] = [];
 
       if (geminiKey) {
         try {
@@ -410,23 +411,33 @@ async function startServer() {
 2. 各テキストブロックのスタイル情報を推定（フォントサイズ、太字/通常、配置）
 3. テキストブロックをコンテキストグループ（title/header/body/table/form/footer等）に分類
 4. フォームフィールドがあれば検出して追加
+5. OCRテキストと修正テキストに差異がある場合、corrections配列にsearchString/replaceStringペアを出力
 
 以下のJSONスキーマで返してください：
-[{
-  "index": number,        // OCRブロック番号（既存ブロックの場合）
-  "text": string,         // 修正済みテキスト
-  "box": [ymin, xmin, ymax, xmax],  // 座標（0-1000スケール）
-  "fontSize": number,     // 推定フォントサイズ(pt)
-  "fontFamily": string,   // フォント推定
-  "fontWeight": "bold" | "normal",
-  "fontStyle": "italic" | "normal",
-  "textAlign": "left" | "center" | "right",
-  "color": string,        // hex color
-  "group": string,        // コンテキストグループ名
-  "groupType": "title" | "header" | "body" | "table" | "form" | "footer" | "label" | "value"
-}]
+{
+  "blocks": [{
+    "index": number,
+    "text": string,
+    "originalText": string,
+    "box": [ymin, xmin, ymax, xmax],
+    "fontSize": number,
+    "fontFamily": string,
+    "fontWeight": "bold" | "normal",
+    "fontStyle": "italic" | "normal",
+    "textAlign": "left" | "center" | "right",
+    "color": string,
+    "group": string,
+    "groupType": "title" | "header" | "body" | "table" | "form" | "footer" | "label" | "value"
+  }],
+  "corrections": [{
+    "searchString": string,
+    "replaceString": string,
+    "page": number,
+    "reason": string
+  }]
+}
 
-有効なJSON配列のみ返してください。`;
+有効なJSONのみ返してください。`;
 
           const parts: any[] = [
             { inlineData: { mimeType: mimeForGemini, data: contentToAnalyze } },
@@ -445,8 +456,11 @@ async function startServer() {
             const parsed = JSON.parse(responseText);
             if (Array.isArray(parsed)) {
               styledBlocks = parsed;
-              console.log(`[analyze-page] Gemini returned ${styledBlocks.length} structured blocks`);
+            } else if (parsed.blocks && Array.isArray(parsed.blocks)) {
+              styledBlocks = parsed.blocks;
+              geminiCorrections = parsed.corrections || [];
             }
+            console.log(`[analyze-page] Gemini returned ${styledBlocks.length} blocks, ${geminiCorrections.length} corrections`);
           }
         } catch (err: any) {
           console.warn(`[analyze-page] Gemini structuring failed: ${err.message}`);
@@ -497,6 +511,7 @@ async function startServer() {
       console.log(`[analyze-page] Pipeline complete. Returning ${finalBlocks.length} blocks`);
       res.json({
         blocks: finalBlocks,
+        corrections: geminiCorrections,
         phases: {
           docai: ocrBlocks.length,
           gemini: styledBlocks.length,
@@ -749,6 +764,87 @@ ${ocrText}`;
     } catch (error: any) {
       console.error("Gemini structuring error:", error);
       res.status(500).json({ error: "テキスト整頓中にエラーが発生しました。", details: error.message });
+    }
+  });
+
+  // ================================================================
+  // PDF.co Text Replacement API
+  // ================================================================
+
+  app.post('/api/export/pdfco', async (req, res) => {
+    try {
+      const PDFCO_API_KEY = process.env.PDFCO_API_KEY;
+      if (!PDFCO_API_KEY) {
+        return res.status(500).json({ error: 'PDFCO_API_KEY が設定されていません。' });
+      }
+
+      const { pdfBase64, filename, replacements } = req.body;
+
+      if (!pdfBase64 || !replacements || replacements.length === 0) {
+        return res.status(400).json({ error: 'pdfBase64 と replacements が必要です。' });
+      }
+
+      // Step 1: PDF.co にファイルをアップロード
+      const uploadResponse = await fetch('https://api.pdf.co/v1/file/upload/base64', {
+        method: 'POST',
+        headers: {
+          'x-api-key': PDFCO_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          file: pdfBase64,
+          name: filename || 'input.pdf',
+        }),
+      });
+
+      const uploadData = await uploadResponse.json();
+      if (uploadData.error) {
+        throw new Error(`PDF.co アップロードエラー: ${uploadData.message || uploadData.error}`);
+      }
+
+      const uploadedFileUrl = uploadData.url;
+
+      // Step 2: 各置換を順次実行
+      // PDF.co の replace-text は1回の呼び出しで1ペアのみ処理するため、
+      // 複数置換はチェーン実行する
+      let currentUrl = uploadedFileUrl;
+
+      for (let i = 0; i < replacements.length; i++) {
+        const { searchString, replaceString } = replacements[i];
+
+        // 空文字への置換 = 削除
+        const replaceResponse = await fetch('https://api.pdf.co/v1/pdf/edit/replace-text', {
+          method: 'POST',
+          headers: {
+            'x-api-key': PDFCO_API_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            url: currentUrl,
+            searchString: searchString,
+            replaceString: replaceString,
+            name: `edited_${filename || 'output.pdf'}`,
+          }),
+        });
+
+        const replaceData = await replaceResponse.json();
+        if (replaceData.error) {
+          console.warn(`PDF.co 置換エラー (${i + 1}/${replacements.length}):`, replaceData);
+          // エラーでも続行（部分的な置換を許容）
+          continue;
+        }
+
+        currentUrl = replaceData.url;
+      }
+
+      res.json({
+        url: currentUrl,
+        replacementCount: replacements.length,
+      });
+
+    } catch (error: any) {
+      console.error('PDF.co export error:', error);
+      res.status(500).json({ error: error.message });
     }
   });
 
