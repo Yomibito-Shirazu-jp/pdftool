@@ -1334,10 +1334,10 @@ body {
                 "flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-bold transition-all pro-button",
                 activeTool === 'edit' ? "bg-white text-[#E5322E] shadow-sm" : "text-[#666] hover:text-[#E5322E]"
               )}
-              onClick={() => setActiveTool('edit')}
+              onClick={() => { setActiveTool('edit'); detectTextAI(); }}
             >
-              <Layers size={13} />
-              <span>AI編集</span>
+              <Sparkles size={13} />
+              <span>PDF解析</span>
               <div className="w-3 h-3 bg-yellow-400 rounded-full flex items-center justify-center text-[7px] text-black border border-white">👑</div>
             </button>
           </div>

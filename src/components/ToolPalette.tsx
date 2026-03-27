@@ -51,49 +51,11 @@ export const ToolPalette: React.FC<ToolPaletteProps> = ({
           onClick={() => {
             if (isDetecting) return;
             setActiveTool('edit');
-            detectTextStandard();
-          }}
-          disabled={isDetecting}
-          className={cn(
-            "flex items-center gap-2 px-3 py-1.5 rounded-xl transition-all font-bold text-[11px] tracking-tight pro-button",
-            activeTool === 'edit' 
-              ? "bg-[#1D1D1F] text-white shadow-lg" 
-              : "bg-[#F5F5F7] text-[#1D1D1F] hover:bg-[#1D1D1F]/10",
-            isDetecting && "opacity-80 cursor-wait"
-          )}
-        >
-          <MousePointer2 size={14} />
-          <span>原本抽出</span>
-        </button>
-
-        <button 
-          onClick={() => {
-            if (isDetecting) return;
-            setActiveTool('edit');
-            detectTextVision();
-          }}
-          disabled={isDetecting}
-          className={cn(
-            "flex items-center gap-2 px-3 py-1.5 rounded-xl transition-all font-bold text-[11px] tracking-tight pro-button",
-            activeTool === 'edit' 
-              ? "bg-[#1D1D1F] text-white shadow-lg" 
-              : "bg-[#F5F5F7] text-[#1D1D1F] hover:bg-[#1D1D1F]/10",
-            isDetecting && "opacity-80 cursor-wait"
-          )}
-        >
-          <Eye size={14} />
-          <span>Vision API</span>
-        </button>
-
-        <button 
-          onClick={() => {
-            if (isDetecting) return;
-            setActiveTool('edit');
             detectTextAI();
           }}
           disabled={isDetecting}
           className={cn(
-            "flex items-center gap-2 px-3 py-1.5 rounded-xl transition-all font-bold text-[11px] tracking-tight pro-button relative overflow-hidden",
+            "flex items-center gap-2 px-4 py-2 rounded-xl transition-all font-bold text-[12px] tracking-tight pro-button relative overflow-hidden",
             activeTool === 'edit' 
               ? "bg-[#E5322E] text-white shadow-lg shadow-red-500/20" 
               : "bg-[#F5F5F7] text-[#E5322E] hover:bg-[#E5322E]/10",
@@ -108,8 +70,8 @@ export const ToolPalette: React.FC<ToolPaletteProps> = ({
             className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent"
           />
         )}
-        <Sparkles size={14} className={cn(activeTool === 'edit' || isDetecting ? "animate-pulse" : "")} />
-        <span>{isDetecting ? '解析中...' : 'AIマッピング'}</span>
+        <Sparkles size={15} className={cn(activeTool === 'edit' || isDetecting ? "animate-pulse" : "")} />
+        <span>{isDetecting ? '解析中...' : 'PDF解析'}</span>
       </button>
       </div>
       
