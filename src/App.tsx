@@ -237,8 +237,8 @@ body {
   const [supabaseDocId, setSupabaseDocId] = useState<string | null>(null);
 
   // Auto-save OCR results to Supabase via server API
-  const saveOCRResults = async (newAnnotations: Annotation[], source?: string) => {
-    if (!user || !pdfFile) return;
+  const saveOCRResults = async (newAnnotations: Annotation[], source?: string): Promise<string[]> => {
+    if (!pdfFile) return [];
     try {
       // Convert annotations to block format for Supabase
       const blocks = newAnnotations.map(ann => ({
@@ -263,7 +263,7 @@ body {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          firebase_uid: user.uid,
+          firebase_uid: user?.uid || 'guest',
           filename: pdfFile.name,
           page_count: numPages,
           blocks
@@ -274,8 +274,10 @@ body {
       const data = await response.json();
       setSupabaseDocId(data.document_id);
       console.log(`OCR results saved to Supabase (doc: ${data.document_id}, ${data.block_count} blocks)`);
+      return data.block_ids || [];
     } catch (error) {
       console.warn('Failed to save OCR results:', error);
+      return [];
     }
   };
 
@@ -647,8 +649,18 @@ body {
             };
           });
           setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
-          saveOCRResults(newAnnotations, 'unified-pipeline');
-          console.log(`[detectTextAI] Pipeline complete: ${newAnnotations.length} blocks (DocAI: ${data.phases?.docai}, Gemini: ${data.phases?.gemini})`);
+          // Save to DB and get block IDs
+          const blockIds = await saveOCRResults(newAnnotations, 'unified-pipeline');
+          if (blockIds.length > 0) {
+            setAnnotations(prev => prev.map((ann, idx) => {
+              const annIdx = prev.filter(a => a.page === currentPage).indexOf(ann);
+              if (ann.page === currentPage && ann.type === 'ai-edit' && annIdx >= 0 && annIdx < blockIds.length) {
+                return { ...ann, dbBlockId: blockIds[annIdx] };
+              }
+              return ann;
+            }));
+          }
+          console.log(`[detectTextAI] Pipeline complete: ${newAnnotations.length} blocks → DB saved (${blockIds.length} IDs)`);
         }
       }
       setScanProgress(100);
@@ -1793,6 +1805,15 @@ body {
                               <textarea 
                                 value={ann.content} 
                                 onChange={(e) => setAnnotations(annotations.map(a => a.id === ann.id ? { ...a, content: e.target.value } : a))}
+                                onBlur={(e) => {
+                                  if (ann.dbBlockId) {
+                                    fetch(`/api/blocks/${ann.dbBlockId}`, {
+                                      method: 'PATCH',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({ user_text: e.target.value })
+                                    }).catch(err => console.warn('DB save failed:', err));
+                                  }
+                                }}
                                 className={cn(
                                   "border-none outline-none w-full resize-none overflow-hidden transition-colors",
                                   ann.maskBackground ? "bg-white" : "bg-transparent",

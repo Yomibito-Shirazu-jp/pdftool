@@ -23,6 +23,8 @@ export interface Annotation {
   className?: string;
   maskBackground?: boolean;
   isConfirmed?: boolean;
+  dbBlockId?: string;
+  opacity?: number;
 }
 
 export interface TextBlock {

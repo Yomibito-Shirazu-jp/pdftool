@@ -556,14 +556,16 @@ async function startServer() {
           sort_order: i
         }));
 
-        const { error: blocksError } = await getSupabase()
+        const { data: insertedBlocks, error: blocksError } = await getSupabase()
           .from('extracted_blocks')
-          .insert(blockRecords);
+          .insert(blockRecords)
+          .select('id, sort_order');
 
         if (blocksError) throw blocksError;
+        res.json({ document_id: doc!.id, block_count: blocks?.length || 0, block_ids: (insertedBlocks || []).sort((a: any, b: any) => a.sort_order - b.sort_order).map((b: any) => b.id) });
+      } else {
+        res.json({ document_id: doc!.id, block_count: 0, block_ids: [] });
       }
-
-      res.json({ document_id: doc.id, block_count: blocks?.length || 0 });
     } catch (error: any) {
       console.error('POST /api/documents error:', error);
       res.status(500).json({ error: error.message });
