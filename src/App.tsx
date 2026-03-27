@@ -550,278 +550,113 @@ body {
 
   const detectTextAI = async (targetIds?: string[]) => {
     if (!canvasRef.current || !pdfDoc) return;
-    
     const isPartial = targetIds && targetIds.length > 0;
-    const idsToProcess = isPartial ? targetIds : [];
-
     setIsDetecting(true);
     setScanProgress(0);
     setScanPhase('doc-ai');
     setDocAIError(null);
-    setTimeRemaining(isPartial ? 5 : 12); 
-
+    setTimeRemaining(isPartial ? 5 : 15);
     const progressInterval = setInterval(() => {
       setScanProgress(prev => {
         if (prev >= 98) return prev;
-        // Faster progress: 5-8% per second initially, then slowing down
-        const increment = prev < 50 ? (Math.random() * 6 + 4) : (Math.random() * 3 + 1);
+        const increment = prev < 30 ? (Math.random() * 5 + 3) : prev < 70 ? (Math.random() * 3 + 1) : (Math.random() * 1 + 0.5);
         return Math.min(98, prev + increment);
       });
       setTimeRemaining(prev => Math.max(1, prev - 1));
     }, 1000);
-
     try {
+      let pdfBase64 = '';
+      if (pdfFile) {
+        const buf = await pdfFile.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) { binary += String.fromCharCode(bytes[i]); }
+        pdfBase64 = btoa(binary);
+      }
       const originalCanvas = canvasRef.current;
-      const maxDim = 3072; 
+      const maxDim = 3072;
       let width = originalCanvas.width;
       let height = originalCanvas.height;
-      
       if (width > maxDim || height > maxDim) {
-        if (width > height) {
-          height = (maxDim / width) * height;
-          width = maxDim;
-        } else {
-          width = (maxDim / height) * width;
-          height = maxDim;
-        }
+        if (width > height) { height = (maxDim / width) * height; width = maxDim; }
+        else { width = (maxDim / height) * width; height = maxDim; }
       }
-      
       const offscreenCanvas = document.createElement('canvas');
       offscreenCanvas.width = width;
       offscreenCanvas.height = height;
       const ctx = offscreenCanvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = 'white';
-        ctx.fillRect(0, 0, width, height);
-        ctx.drawImage(originalCanvas, 0, 0, width, height);
-      }
-      
-      const imageData = offscreenCanvas.toDataURL('image/png').split(',')[1];
-      
-      // --- PHASE 1: Document AI Detection (send PDF raw bytes for max accuracy) ---
-      let docAIBlocks = [];
-      
-      // Only run Document AI for full page detection
-      if (!isPartial && !useGeminiOnly) {
-        if (projectId && processorId) {
-          setScanPhase('doc-ai');
-          setScanProgress(5);
-          
-          try {
-            // Send raw PDF bytes instead of PNG screenshot
-            let pdfBase64 = '';
-            if (pdfFile) {
-              const buf = await pdfFile.arrayBuffer();
-              const bytes = new Uint8Array(buf);
-              let binary = '';
-              for (let i = 0; i < bytes.length; i++) {
-                binary += String.fromCharCode(bytes[i]);
-              }
-              pdfBase64 = btoa(binary);
-            }
-
-            const docAIResponse = await fetchWithRetry('/api/detect', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ 
-                image: pdfBase64 || imageData,
-                mimeType: pdfBase64 ? 'application/pdf' : 'image/png',
-                pageNumber: currentPage,
-                processorId: processorId,
-                projectId: projectId,
-                location: location
-              })
-            });
-
-            if (!docAIResponse.ok) {
-              const errorData = await docAIResponse.json().catch(() => ({}));
-              console.warn("Document AI failed, falling back to Gemini-only analysis.", errorData);
-              
-              const errorMessage = errorData.details || errorData.error || '不明なエラー';
-              
-              if (docAIResponse.status === 403 || docAIResponse.status === 401 || errorMessage.includes('PERMISSION_DENIED')) {
-                const deniedProject = errorMessage.match(/projects\/([^\/]+)/)?.[1];
-                if (deniedProject && deniedProject !== projectId) {
-                  setDocAIError(`GCP プロジェクト不一致: 現在の設定は '${projectId}' ですが、アクセス先は '${deniedProject}' です。正しいプロジェクトIDを入力してください。`);
-                } else {
-                  setDocAIError(`GCP 権限エラー: ${errorMessage}\n※ サービスアカウントに 'Document AI API User' ロールが付与されているか確認してください。`);
-                }
-              } else if (docAIResponse.status === 500) {
-                setDocAIError(`サーバーエラー (500): ${errorMessage}\n※ GCP サービスアカウントの認証情報 (GOOGLE_APPLICATION_CREDENTIALS) が正しく設定されているか確認してください。`);
-              } else {
-                setDocAIError(`Document AI エラー (${docAIResponse.status}): ${errorMessage}`);
-              }
-            } else {
-              const data = await docAIResponse.json();
-              docAIBlocks = data.blocks || [];
-            }
-          } catch (err) {
-            console.warn("Document AI request failed, falling back to Gemini-only analysis.", err);
-            setDocAIError("ネットワークエラー: Document AI への接続に失敗しました。");
-          }
-        } else {
-          // Missing config
-          console.log("Document AI configuration missing, using Gemini-only analysis.");
-          setDocAIError("GCP 設定未完了: プロジェクトIDまたはプロセッサーIDが設定されていないため、Gemini のみで解析します。");
-        }
-      }
-
-      // --- PHASE 1.5: Retry via Vision API if Document AI returned nothing ---
-      if (docAIBlocks.length === 0 && !isPartial) {
-        setScanPhase('doc-ai');
-        setScanProgress(20);
-        console.log('Document AI returned no blocks, trying Vision API as fallback...');
-        try {
-          const visionResponse = await fetchWithRetry('/api/detect-vision', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: imageData, projectId })
-          });
-          if (visionResponse.ok) {
-            const visionData = await visionResponse.json();
-            docAIBlocks = visionData.blocks || [];
-            console.log(`Vision API fallback returned ${docAIBlocks.length} blocks.`);
-          }
-        } catch (err) {
-          console.warn('Vision API fallback also failed:', err);
-        }
-      }
-
-      // --- PHASE 2: Gemini Text Correction & Style Extraction ---
-      // Document AI/Vision coordinates are KEPT as-is. Gemini only corrects text & extracts styles.
-      setScanPhase('gemini-correction');
-      setScanProgress(30);
-      
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) throw new Error("Gemini API Key is missing");
-      const ai = new GoogleGenAI({ apiKey });
-
-      const canvasWidth = canvasRef.current.width / scale;
-      const canvasHeight = canvasRef.current.height / scale;
-
-      const geminiFormatBlocks = async (blocks: any[], retries = 2): Promise<any[]> => {
-        try {
-          const targetAnnotations = isPartial 
-            ? annotations.filter(a => idsToProcess.includes(a.id))
-            : [];
-
-          const promptText = isPartial 
-            ? `以下のテキストブロックの内容を画像と照合して修正してください。座標は変更不要です。
-
-${targetAnnotations.map((a, i) => `[${i}] id="${a.id}" text="${a.content}"`).join('\n')}
-
-各ブロックに対して、以下のJSONスキーマで返してください:
-{ id: string, text: string, fontSize: number, fontFamily: string, textAlign: "left"|"center"|"right", color: string(hex), fontWeight: "bold"|"normal", fontStyle: "italic"|"normal" }`
-            : `以下はOCRで検出された${blocks.length}個のテキストブロックです。画像を参照して各ブロックのテキストを正確に修正し、スタイル情報を推定してください。
-
-※ 座標(box)の変更は一切不要です。index番号で元ブロックと1:1対応させてください。
-
-${blocks.map((b: any, i: number) => `[${i}] "${b.text}"`).join('\n')}
-
-各ブロックに対して以下のJSONスキーマで返してください:
-{ index: number, text: string, fontSize: number, fontFamily: string, textAlign: "left"|"center"|"right", color: string(hex), fontWeight: "bold"|"normal", fontStyle: "italic"|"normal" }`;
-
-          const response = await ai.models.generateContent({
-            model: "gemini-2.5-pro",
-            contents: [
-              {
-                parts: [
-                  { text: promptText },
-                  { inlineData: { mimeType: "image/png", data: imageData } }
-                ]
-              }
-            ],
-            config: {
-              systemInstruction: "あなたは高精度なドキュメント復元エンジンです。OCRのテキスト誤りを修正し、スタイル情報を推定してください。座標は一切変更しないでください。有効なJSONのみ返してください。",
-              responseMimeType: "application/json"
-            }
-          });
-
-          const text = response.text;
-          if (!text) throw new Error("Gemini returned an empty response");
-          
-          const parsed = JSON.parse(text);
-          if (!Array.isArray(parsed)) throw new Error("Gemini response is not an array");
-          return parsed;
-        } catch (err) {
-          if (retries > 0) {
-            console.warn(`Gemini error, retrying... (${retries} left)`, err);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return geminiFormatBlocks(blocks, retries - 1);
-          }
-          throw err;
-        }
-      };
-
-      // If we have blocks, run Gemini formatting. Otherwise use blocks as-is.
-      let styledResults: any[] = [];
-      if (docAIBlocks.length > 0) {
-        try {
-          styledResults = await geminiFormatBlocks(docAIBlocks);
-        } catch (err) {
-          console.warn('Gemini formatting failed, using raw OCR blocks:', err);
-          styledResults = docAIBlocks.map((b: any, i: number) => ({ index: i, text: b.text }));
-        }
-      }
-
+      if (ctx) { ctx.fillStyle = 'white'; ctx.fillRect(0, 0, width, height); ctx.drawImage(originalCanvas, 0, 0, width, height); }
+      const imageBase64 = offscreenCanvas.toDataURL('image/png').split(',')[1];
       if (isPartial) {
-        // Update existing annotations - only text & styles, keep coordinates
-        setAnnotations(prev => prev.map(ann => {
-          const update = styledResults.find((r: any) => r.id === ann.id);
-          if (update) {
-            return {
-              ...ann,
-              content: update.text || ann.content,
-              fontSize: update.fontSize || ann.fontSize,
-              fontFamily: update.fontFamily || ann.fontFamily,
-              textAlign: update.textAlign || ann.textAlign,
-              color: update.color || ann.color,
-              fontWeight: update.fontWeight || ann.fontWeight,
-              fontStyle: update.fontStyle || ann.fontStyle,
-            };
-          }
-          return ann;
-        }));
-        setAnalysisQueue(prev => prev.filter(id => !idsToProcess.includes(id)));
-        setSelectedIds([]);
-      } else {
-        // Full page: merge Document AI coordinates with Gemini styles
-        const newAnnotations: Annotation[] = docAIBlocks.map((block: any, index: number) => {
-          const box = block.box;
-          const style = styledResults.find((s: any) => s.index === index) || {};
-          return {
-            id: `ai-${Date.now()}-${index}`,
-            type: 'ai-edit',
-            page: currentPage,
-            x: (box[1] / 1000) * canvasWidth,
-            y: (box[0] / 1000) * canvasHeight,
-            width: ((box[3] - box[1]) / 1000) * canvasWidth,
-            height: ((box[2] - box[0]) / 1000) * canvasHeight,
-            content: style.text || block.text,
-            fontSize: style.fontSize || 12,
-            fontFamily: style.fontFamily || 'Noto Sans JP',
-            color: style.color || '#000000',
-            textAlign: style.textAlign || 'left',
-            fontWeight: style.fontWeight || 'normal',
-            fontStyle: style.fontStyle || 'normal',
-            maskBackground: true,
-          };
+        setScanPhase('gemini-correction');
+        const response = await fetchWithRetry('/api/analyze-page', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ imageBase64, pageNumber: currentPage, processorId, projectId, location })
         });
-        setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
-        
-        // Auto-save OCR results to Firestore
-        saveOCRResults(newAnnotations, 'docai+gemini');
+        if (response.ok) {
+          const data = await response.json();
+          setAnnotations(prev => prev.map(ann => {
+            if (!targetIds!.includes(ann.id)) return ann;
+            const bestMatch = data.blocks?.find((b: any) => {
+              const bx = (b.box[1] / 1000) * (canvasRef.current!.width / scale);
+              const by = (b.box[0] / 1000) * (canvasRef.current!.height / scale);
+              return Math.abs(bx - ann.x) < 50 && Math.abs(by - ann.y) < 50;
+            });
+            if (bestMatch) {
+              return { ...ann, content: bestMatch.text || ann.content, fontSize: bestMatch.fontSize || ann.fontSize, fontFamily: bestMatch.fontFamily || ann.fontFamily, textAlign: bestMatch.textAlign || ann.textAlign, color: bestMatch.color || ann.color, fontWeight: bestMatch.fontWeight || ann.fontWeight, fontStyle: bestMatch.fontStyle || ann.fontStyle };
+            }
+            return ann;
+          }));
+          setAnalysisQueue(prev => prev.filter(id => !targetIds!.includes(id)));
+          setSelectedIds([]);
+        }
+      } else {
+        setScanPhase('doc-ai');
+        setScanProgress(10);
+        const response = await fetchWithRetry('/api/analyze-page', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pdfBase64: pdfBase64 || undefined, imageBase64, pageNumber: currentPage, processorId, projectId, location })
+        });
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          setDocAIError(`解析エラー (${response.status}): ${errorData.details || errorData.error || '不明なエラー'}`);
+        } else {
+          const data = await response.json();
+          setScanPhase('gemini-correction');
+          setScanProgress(80);
+          const canvasWidth = canvasRef.current!.width / scale;
+          const canvasHeight = canvasRef.current!.height / scale;
+          const newAnnotations: Annotation[] = (data.blocks || []).map((block: any, index: number) => {
+            const box = block.box;
+            return {
+              id: `ai-${Date.now()}-${index}`,
+              type: 'ai-edit' as const,
+              page: currentPage,
+              x: (box[1] / 1000) * canvasWidth,
+              y: (box[0] / 1000) * canvasHeight,
+              width: ((box[3] - box[1]) / 1000) * canvasWidth,
+              height: ((box[2] - box[0]) / 1000) * canvasHeight,
+              content: block.text,
+              fontSize: block.fontSize || 12,
+              fontFamily: block.fontFamily || 'Noto Sans JP',
+              color: block.color || '#000000',
+              textAlign: block.textAlign || 'left',
+              fontWeight: block.fontWeight || 'normal',
+              fontStyle: block.fontStyle || 'normal',
+              maskBackground: true,
+            };
+          });
+          setAnnotations(prev => [...prev.filter(a => a.page !== currentPage), ...newAnnotations]);
+          saveOCRResults(newAnnotations, 'unified-pipeline');
+          console.log(`[detectTextAI] Pipeline complete: ${newAnnotations.length} blocks (DocAI: ${data.phases?.docai}, Gemini: ${data.phases?.gemini})`);
+        }
       }
-
       setScanProgress(100);
       setTimeRemaining(0);
-      setTimeout(() => {
-        setIsDetecting(false);
-        setActiveTool('select');
-      }, 500);
+      setTimeout(() => { setIsDetecting(false); setActiveTool('select'); }, 500);
     } catch (err: any) {
       console.error('Pipeline Error:', err);
-      setLoadingError(`Pipeline Error: ${err.message}`);
+      setDocAIError(`パイプラインエラー: ${err.message}`);
       setIsDetecting(false);
     } finally {
       clearInterval(progressInterval);

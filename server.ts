@@ -253,6 +253,267 @@ async function startServer() {
   });
 
   // ================================================================
+  // UNIFIED ANALYSIS PIPELINE — /api/analyze-page
+  // Runs: Document AI → Vision API fallback → Gemini structuring
+  // All server-side, no API keys needed on frontend
+  // ================================================================
+  app.post("/api/analyze-page", async (req, res) => {
+    try {
+      const { pdfBase64, imageBase64, pageNumber, processorId: reqProcessorId, projectId: reqProjectId, location: reqLocation } = req.body;
+
+      const effectiveProjectId = reqProjectId || process.env.GOOGLE_CLOUD_PROJECT_ID;
+      const effectiveLocation = reqLocation || process.env.GOOGLE_CLOUD_LOCATION || "us";
+      const effectiveProcessorId = reqProcessorId || process.env.DOCUMENT_AI_PROCESSOR_ID;
+
+      console.log(`[analyze-page] Starting pipeline for page ${pageNumber}`);
+
+      // ── PHASE 1: Document AI OCR ──
+      let ocrBlocks: any[] = [];
+      let fullText = '';
+      
+      if (effectiveProjectId && effectiveProcessorId) {
+        try {
+          console.log(`[analyze-page] Phase 1: Document AI OCR...`);
+          const clientOptions: any = {};
+          const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS
+            ? JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS)
+            : undefined;
+          if (credentials) clientOptions.credentials = credentials;
+          if (effectiveProjectId) clientOptions.projectId = effectiveProjectId;
+          if (effectiveLocation && effectiveLocation !== 'us') {
+            clientOptions.apiEndpoint = `${effectiveLocation}-documentai.googleapis.com`;
+          }
+
+          const regionalClient = new DocumentProcessorServiceClient(clientOptions);
+          const name = `projects/${effectiveProjectId}/locations/${effectiveLocation}/processors/${effectiveProcessorId}`;
+          
+          const contentToSend = pdfBase64 || imageBase64;
+          const mimeType = pdfBase64 ? "application/pdf" : "image/png";
+
+          const request: any = {
+            name,
+            rawDocument: { content: contentToSend, mimeType },
+            processOptions: {
+              ocrConfig: {
+                enableNativePdfParsing: mimeType === "application/pdf",
+                hints: { languageHints: ["ja", "en"] },
+              },
+              ...(pageNumber && mimeType === "application/pdf" ? {
+                individualPageSelector: { pages: [pageNumber] }
+              } : {})
+            }
+          };
+
+          const [result] = await regionalClient.processDocument(request);
+          const { document } = result;
+          fullText = document?.text || '';
+          console.log(`[analyze-page] Document AI: ${document?.pages?.length} pages, ${fullText.length} chars`);
+
+          const pages = document?.pages || [];
+          for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+            const page = pages[pageIdx];
+            const currentPageNum = pageNumber || (pageIdx + 1);
+            const elements = page.blocks?.length ? page.blocks
+              : page.paragraphs?.length ? page.paragraphs
+              : page.lines?.length ? page.lines
+              : page.visualElements || [];
+
+            for (const el of elements) {
+              const vertices = el.layout?.boundingPoly?.normalizedVertices || [];
+              if (vertices.length === 0) continue;
+              const ymin = Math.min(...vertices.map((v: any) => v.y ?? 0)) * 1000;
+              const xmin = Math.min(...vertices.map((v: any) => v.x ?? 0)) * 1000;
+              const ymax = Math.max(...vertices.map((v: any) => v.y ?? 0)) * 1000;
+              const xmax = Math.max(...vertices.map((v: any) => v.x ?? 0)) * 1000;
+
+              let text = '';
+              const segments = el.layout?.textAnchor?.textSegments || [];
+              for (const seg of segments) {
+                const start = Number(seg.startIndex || 0);
+                const end = Number(seg.endIndex || 0);
+                text += document?.text?.substring(start, end) || '';
+              }
+              text = text.trim();
+              if (text.length > 0) {
+                ocrBlocks.push({ text, box: [ymin, xmin, ymax, xmax], page: currentPageNum, confidence: el.layout?.confidence || 0 });
+              }
+            }
+          }
+          console.log(`[analyze-page] Document AI returned ${ocrBlocks.length} blocks`);
+        } catch (err: any) {
+          console.warn(`[analyze-page] Document AI failed: ${err.message}`);
+        }
+      }
+
+      // ── PHASE 2: Vision API fallback ──
+      if (ocrBlocks.length === 0 && imageBase64) {
+        try {
+          console.log(`[analyze-page] Phase 2: Vision API fallback...`);
+          const [result] = await visionClient.documentTextDetection({
+            image: { content: imageBase64 }
+          });
+          const fullTextAnnotation = result.fullTextAnnotation;
+          if (fullTextAnnotation?.pages) {
+            for (const vPage of fullTextAnnotation.pages) {
+              if (vPage.blocks) {
+                for (const block of vPage.blocks) {
+                  if (block.paragraphs) {
+                    for (const paragraph of block.paragraphs) {
+                      const vertices = paragraph.boundingBox?.normalizedVertices || paragraph.boundingBox?.vertices || [];
+                      const isNormalized = vertices.length > 0 && (vertices[0] as any).x <= 1 && (vertices[0] as any).y <= 1;
+                      const ymin = Math.min(...vertices.map((v: any) => v.y || 0)) * (isNormalized ? 1000 : 1);
+                      const xmin = Math.min(...vertices.map((v: any) => v.x || 0)) * (isNormalized ? 1000 : 1);
+                      const ymax = Math.max(...vertices.map((v: any) => v.y || 0)) * (isNormalized ? 1000 : 1);
+                      const xmax = Math.max(...vertices.map((v: any) => v.x || 0)) * (isNormalized ? 1000 : 1);
+                      let text = "";
+                      if (paragraph.words) {
+                        text = paragraph.words.map((w: any) => w.symbols?.map((s: any) => s.text).join("")).join(" ");
+                      }
+                      if (text.trim().length > 0) {
+                        ocrBlocks.push({ text: text.trim(), box: [ymin, xmin, ymax, xmax] });
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          fullText = fullTextAnnotation?.text || '';
+          console.log(`[analyze-page] Vision API returned ${ocrBlocks.length} blocks`);
+        } catch (err: any) {
+          console.warn(`[analyze-page] Vision API failed: ${err.message}`);
+        }
+      }
+
+      // ── PHASE 3: Gemini document understanding + structuring ──
+      const geminiKey = process.env.GEMINI_API_KEY;
+      let styledBlocks: any[] = [];
+
+      if (geminiKey) {
+        try {
+          console.log(`[analyze-page] Phase 3: Gemini structuring...`);
+          const genAI = new GoogleGenerativeAI(geminiKey);
+          const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-05-20" });
+
+          // Send raw PDF to Gemini for structural understanding (Vertex AI best practice)
+          const contentToAnalyze = pdfBase64 || imageBase64;
+          const mimeForGemini = pdfBase64 ? "application/pdf" : "image/png";
+
+          const ocrContext = ocrBlocks.length > 0
+            ? `\n\n以下はOCRで抽出された${ocrBlocks.length}個のテキストブロックです（座標は0-1000スケール [ymin, xmin, ymax, xmax]）：\n${ocrBlocks.map((b: any, i: number) => `[${i}] box=${JSON.stringify(b.box)} text="${b.text}"`).join('\n')}`
+            : '';
+
+          const prompt = `このドキュメントのページ${pageNumber || 1}を分析してください。${ocrContext}
+
+以下の作業を行ってください：
+1. OCRテキストの誤りを画像/PDFと照合して修正
+2. 各テキストブロックのスタイル情報を推定（フォントサイズ、太字/通常、配置）
+3. テキストブロックをコンテキストグループ（title/header/body/table/form/footer等）に分類
+4. フォームフィールドがあれば検出して追加
+
+以下のJSONスキーマで返してください：
+[{
+  "index": number,        // OCRブロック番号（既存ブロックの場合）
+  "text": string,         // 修正済みテキスト
+  "box": [ymin, xmin, ymax, xmax],  // 座標（0-1000スケール）
+  "fontSize": number,     // 推定フォントサイズ(pt)
+  "fontFamily": string,   // フォント推定
+  "fontWeight": "bold" | "normal",
+  "fontStyle": "italic" | "normal",
+  "textAlign": "left" | "center" | "right",
+  "color": string,        // hex color
+  "group": string,        // コンテキストグループ名
+  "groupType": "title" | "header" | "body" | "table" | "form" | "footer" | "label" | "value"
+}]
+
+有効なJSON配列のみ返してください。`;
+
+          const parts: any[] = [
+            { inlineData: { mimeType: mimeForGemini, data: contentToAnalyze } },
+            { text: prompt }
+          ];
+
+          const result = await model.generateContent({
+            contents: [{ role: "user", parts }],
+            generationConfig: {
+              responseMimeType: "application/json",
+            },
+          });
+
+          const responseText = result.response.text();
+          if (responseText) {
+            const parsed = JSON.parse(responseText);
+            if (Array.isArray(parsed)) {
+              styledBlocks = parsed;
+              console.log(`[analyze-page] Gemini returned ${styledBlocks.length} structured blocks`);
+            }
+          }
+        } catch (err: any) {
+          console.warn(`[analyze-page] Gemini structuring failed: ${err.message}`);
+        }
+      } else {
+        console.log(`[analyze-page] No GEMINI_API_KEY, skipping Gemini phase`);
+      }
+
+      // ── MERGE: Combine OCR coordinates with Gemini styles ──
+      let finalBlocks: any[];
+
+      if (styledBlocks.length > 0) {
+        // Gemini returned structured data — use it
+        finalBlocks = styledBlocks.map((sb: any, i: number) => {
+          // If Gemini provided coordinates, use them. Otherwise fallback to OCR block
+          const ocrBlock = (sb.index !== undefined && ocrBlocks[sb.index]) ? ocrBlocks[sb.index] : null;
+          return {
+            text: sb.text || ocrBlock?.text || '',
+            box: sb.box || ocrBlock?.box || [0, 0, 0, 0],
+            fontSize: sb.fontSize || 12,
+            fontFamily: sb.fontFamily || 'Noto Sans JP',
+            fontWeight: sb.fontWeight || 'normal',
+            fontStyle: sb.fontStyle || 'normal',
+            textAlign: sb.textAlign || 'left',
+            color: sb.color || '#000000',
+            group: sb.group || 'body',
+            groupType: sb.groupType || 'body',
+            confidence: ocrBlock?.confidence || 0,
+          };
+        });
+      } else {
+        // Fallback: OCR blocks only
+        finalBlocks = ocrBlocks.map((b: any) => ({
+          text: b.text,
+          box: b.box,
+          fontSize: 12,
+          fontFamily: 'Noto Sans JP',
+          fontWeight: 'normal',
+          fontStyle: 'normal',
+          textAlign: 'left',
+          color: '#000000',
+          group: 'body',
+          groupType: 'body',
+          confidence: b.confidence || 0,
+        }));
+      }
+
+      console.log(`[analyze-page] Pipeline complete. Returning ${finalBlocks.length} blocks`);
+      res.json({
+        blocks: finalBlocks,
+        phases: {
+          docai: ocrBlocks.length,
+          gemini: styledBlocks.length,
+        },
+        fullText,
+      });
+
+    } catch (error: any) {
+      console.error("[analyze-page] Pipeline error:", error);
+      res.status(500).json({
+        error: "解析パイプラインでエラーが発生しました。",
+        details: error.message,
+      });
+    }
+  });
+
+  // ================================================================
   // Supabase CRUD APIs - DB-backed OCR pipeline
   // ================================================================
 
